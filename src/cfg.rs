@@ -25,7 +25,7 @@ use std::ffi::OsString;
 use std::fmt::{self, Display};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use indexmap::IndexMap;
 use serde_yaml::Value;
 
@@ -435,6 +435,93 @@ impl<'a> CfgObj<'a> {
   pub fn error(&self, msg: impl Display) -> anyhow::Error {
     anyhow::anyhow!("{} at {}", msg, self.path)
   }
+
+  /// Error if this object contains any key not listed in `known`.
+  ///
+  /// Call this for fixed-schema sections so typos like `auto_restart` fail
+  /// instead of being silently ignored. Free-form maps (task names, env vars,
+  /// key bindings) should not use this.
+  pub fn known_keys(&self, known: &[&str]) -> Result<()> {
+    let mut unknown: Vec<&str> = Vec::new();
+    for key in self.map.keys() {
+      match key.as_str() {
+        Some(key) if !known.iter().any(|k| *k == key) => unknown.push(key),
+        None => {
+          bail!("non-string key at {}", self.path);
+        }
+        _ => {}
+      }
+    }
+    if unknown.is_empty() {
+      return Ok(());
+    }
+    // Stable order so error messages are deterministic in tests.
+    unknown.sort_unstable();
+
+    let mut msg = if unknown.len() == 1 {
+      format!("unknown field '{}' at {}", unknown[0], self.path)
+    } else {
+      format!(
+        "unknown fields {} at {}",
+        unknown
+          .iter()
+          .map(|k| format!("'{k}'"))
+          .collect::<Vec<_>>()
+          .join(", "),
+        self.path
+      )
+    };
+
+    if let Some(suggestion) = suggest_key(unknown[0], known) {
+      msg.push_str(&format!("; did you mean '{suggestion}'?"));
+    }
+
+    bail!(msg)
+  }
+}
+
+/// Best-effort typo hint: exact match after stripping `_`/`-`, else small edit distance.
+fn suggest_key<'a>(unknown: &str, known: &[&'a str]) -> Option<&'a str> {
+  fn normalize(s: &str) -> String {
+    s.chars()
+      .filter(|c| *c != '_' && *c != '-')
+      .flat_map(|c| c.to_lowercase())
+      .collect()
+  }
+
+  let u_norm = normalize(unknown);
+  let mut best: Option<(&str, usize)> = None;
+  for k in known {
+    let k_norm = normalize(k);
+    if k_norm == u_norm {
+      return Some(*k);
+    }
+    let dist = edit_distance(&u_norm, &k_norm);
+    let max_dist = if u_norm.len() <= 4 { 1 } else { 2 };
+    if dist <= max_dist {
+      match best {
+        Some((_, d)) if d <= dist => {}
+        _ => best = Some((*k, dist)),
+      }
+    }
+  }
+  best.map(|(k, _)| k)
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+  let a: Vec<char> = a.chars().collect();
+  let b: Vec<char> = b.chars().collect();
+  let mut prev: Vec<usize> = (0..=b.len()).collect();
+  let mut cur = vec![0; b.len() + 1];
+  for (i, ca) in a.iter().enumerate() {
+    cur[0] = i + 1;
+    for (j, cb) in b.iter().enumerate() {
+      let cost = if ca == cb { 0 } else { 1 };
+      cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+    }
+    std::mem::swap(&mut prev, &mut cur);
+  }
+  prev[b.len()]
 }
 
 pub struct CfgArr<'a> {
@@ -639,5 +726,72 @@ impl<T: IntoCfg> IntoCfg for IndexMap<String, T> {
 impl IntoCfg for Value {
   fn into_cfg(&self) -> Value {
     self.clone()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn obj_from_yaml(yaml: &str) -> CfgObj<'static> {
+    // Leak for 'static test lifetime convenience.
+    let value =
+      Box::leak(Box::new(serde_yaml::from_str::<Value>(yaml).expect("yaml")));
+    CfgNode::new(value, CfgPath::root())
+      .as_obj()
+      .expect("object")
+  }
+
+  #[test]
+  fn known_keys_accepts_only_listed_fields() {
+    let obj = obj_from_yaml(
+      r#"
+      autorestart: true
+      cwd: /tmp
+      "#,
+    );
+    obj
+      .known_keys(&["autorestart", "cwd", "env"])
+      .expect("known keys ok");
+  }
+
+  #[test]
+  fn known_keys_rejects_typo_with_suggestion() {
+    let obj = obj_from_yaml("auto_restart: true\n");
+    let err = obj
+      .known_keys(&["autorestart", "autostart", "cwd"])
+      .unwrap_err()
+      .to_string();
+    assert!(err.contains("unknown field 'auto_restart'"), "err={err}");
+    assert!(err.contains("did you mean 'autorestart'?"), "err={err}");
+  }
+
+  #[test]
+  fn known_keys_lists_multiple_unknown_fields() {
+    let obj = obj_from_yaml(
+      r#"
+      foo: 1
+      bar: 2
+      ok: true
+      "#,
+    );
+    let err = obj.known_keys(&["ok"]).unwrap_err().to_string();
+    assert!(err.contains("unknown fields"), "err={err}");
+    assert!(err.contains("'bar'"), "err={err}");
+    assert!(err.contains("'foo'"), "err={err}");
+  }
+
+  #[test]
+  fn suggest_key_matches_after_stripping_underscores() {
+    assert_eq!(
+      suggest_key("scroll_back_len", &["scrollback_len", "cwd"]),
+      Some("scrollback_len")
+    );
+  }
+
+  #[test]
+  fn edit_distance_basic() {
+    assert_eq!(edit_distance("kitten", "sitting"), 3);
+    assert_eq!(edit_distance("same", "same"), 0);
   }
 }

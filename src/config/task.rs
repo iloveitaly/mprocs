@@ -12,6 +12,38 @@ use crate::process::process_spec::ProcessSpec;
 const DEFAULT_SCROLLBACK_LEN: usize = 1000;
 const DEFAULT_MOUSE_SCROLL_SPEED: usize = 5;
 
+/// Keys allowed under `defaults:` (shared process settings, no cmd/deps).
+const TASK_SETTING_KEYS: &[&str] = &[
+  "cwd",
+  "env",
+  "add_path",
+  "autostart",
+  "autorestart",
+  "ready_log",
+  "stop",
+  "log",
+  "scrollback_len",
+  "mouse_scroll_speed",
+];
+
+/// Keys allowed on a full task entry (settings + cmd form + graph fields).
+const TASK_KEYS: &[&str] = &[
+  "cmd",
+  "shell",
+  "deps",
+  "tags",
+  "cwd",
+  "env",
+  "add_path",
+  "autostart",
+  "autorestart",
+  "ready_log",
+  "stop",
+  "log",
+  "scrollback_len",
+  "mouse_scroll_speed",
+];
+
 /// Tag for tasks started on `dekit up` / at launch.
 pub const AUTOSTART_TAG: &str = "autostart";
 /// Tag for tasks spawned over RPC.
@@ -96,6 +128,16 @@ pub(crate) fn parse_task_settings(
   obj: &CfgObj<'_>,
   cx: &CfgCx,
 ) -> Result<TaskConfig> {
+  // Callers that allow extra keys (full task entries) must validate first.
+  // `defaults:` uses this directly and only permits setting keys.
+  obj.known_keys(TASK_SETTING_KEYS)?;
+  parse_task_settings_unchecked(obj, cx)
+}
+
+fn parse_task_settings_unchecked(
+  obj: &CfgObj<'_>,
+  cx: &CfgCx,
+) -> Result<TaskConfig> {
   let mut p = TaskConfig::default();
   if let Some(cwd) = obj.get("cwd") {
     p.cwd = Some(cx.resolve_path(cwd.as_str()?).into_os_string());
@@ -118,7 +160,8 @@ pub(crate) fn task_from_cfg(
   cx: &CfgCx,
 ) -> Result<TaskConfig> {
   let obj = node.as_obj()?;
-  let mut p = parse_task_settings(&obj, cx)?;
+  obj.known_keys(TASK_KEYS)?;
+  let mut p = parse_task_settings_unchecked(&obj, cx)?;
   if let Err(err) = crate::kernel::task_path::TaskPath::new(path.as_str()) {
     bail!("task '{}': {}", path, err);
   }
@@ -222,6 +265,43 @@ pub fn cmd_from_shell(shell: &str) -> ProcessSpec {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::cfg::{CfgCx, CfgDoc};
+  use std::path::PathBuf;
+
+  #[test]
+  fn task_rejects_unknown_keys_with_suggestion() {
+    let yaml = r#"
+cmd: ["echo", "hi"]
+auto_restart: true
+"#;
+    let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+    let cx = CfgCx::new(PathBuf::from("."));
+    let doc =
+      CfgDoc::from_value(value, PathBuf::from("test.yaml"), &cx).unwrap();
+    let err = match task_from_cfg("web".into(), &doc.root(), &cx) {
+      Ok(_) => panic!("expected unknown key error"),
+      Err(e) => e.to_string(),
+    };
+    assert!(err.contains("unknown field 'auto_restart'"), "err={err}");
+    assert!(err.contains("did you mean 'autorestart'?"), "err={err}");
+  }
+
+  #[test]
+  fn defaults_reject_cmd_key() {
+    let yaml = r#"
+cmd: ["echo", "nope"]
+cwd: /tmp
+"#;
+    let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+    let cx = CfgCx::new(PathBuf::from("."));
+    let doc =
+      CfgDoc::from_value(value, PathBuf::from("test.yaml"), &cx).unwrap();
+    let err = match parse_task_settings(&doc.root().as_obj().unwrap(), &cx) {
+      Ok(_) => panic!("expected unknown key error"),
+      Err(e) => e.to_string(),
+    };
+    assert!(err.contains("unknown field 'cmd'"), "err={err}");
+  }
 
   #[test]
   fn add_path_takes_priority_over_base_path() {

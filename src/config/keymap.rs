@@ -31,6 +31,7 @@ impl KeymapConfig {
       Some(node) => node.as_obj()?,
       None => return Ok(()),
     };
+    keymap.known_keys(&["tasks", "term", "term_copy"])?;
     if let Some(tasks) = keymap.get("tasks") {
       add_keys(&mut self.keymap_tasks, &tasks)?;
     }

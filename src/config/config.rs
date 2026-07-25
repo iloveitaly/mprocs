@@ -9,6 +9,27 @@ use crate::config::log::LogConfig;
 use crate::config::task::{TaskConfig, parse_task_settings, task_from_cfg};
 use crate::config::tui::TuiConfig;
 
+/// Top-level keys allowed in the global (`~/.config/dekit/dekit.yaml`) config.
+const ROOT_KEYS_GLOBAL: &[&str] = &[
+  "log",
+  "defaults",
+  "tui",
+  "keymap",
+  "on_init",
+  "on_all_finished",
+];
+
+/// Top-level keys allowed in a project `dekit.yaml`.
+const ROOT_KEYS_LOCAL: &[&str] = &[
+  "log",
+  "defaults",
+  "tui",
+  "keymap",
+  "on_init",
+  "on_all_finished",
+  "tasks",
+];
+
 pub struct Config {
   pub log: LogConfig,
   pub tasks: Vec<TaskConfig>,
@@ -49,6 +70,7 @@ impl Config {
             global.display()
           );
         }
+        obj.known_keys(ROOT_KEYS_GLOBAL)?;
         config.apply(&obj, &cx)?;
       }
     }
@@ -59,6 +81,7 @@ impl Config {
       let cx = CfgCx::new(working_dir.to_path_buf());
       let doc = CfgDoc::load(&ws, &cx)?;
       let obj = doc.root().as_obj()?;
+      obj.known_keys(ROOT_KEYS_LOCAL)?;
       config.apply(&obj, &cx)?;
       if let Some(node) = obj.get("tasks") {
         config.tasks = node

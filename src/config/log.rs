@@ -17,6 +17,7 @@ impl LogConfig {
       Some(node) => node.as_obj()?,
       None => return Ok(()),
     };
+    log_obj.known_keys(&["level", "file"])?;
 
     if let Some(level) = log_obj.optional::<String>("level", cx)? {
       self.level = Some(level);

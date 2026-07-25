@@ -149,6 +149,7 @@ fn parse_log_config(
     }
     Value::Mapping(_) => {
       let obj = node.as_obj()?;
+      obj.known_keys(&["enabled", "dir", "file", "mode", "append"])?;
 
       let enabled = obj.default("enabled", true, cx)?;
 
