@@ -621,6 +621,7 @@ mod tests {
     KernelCommand, KernelQuery, KernelQueryResponse, TaskContext, TaskSelector,
   };
   use crate::kernel::task::TaskId;
+  use crate::kernel::task_key::TaskKey;
   use crate::task::logger::LogSink;
 
   use super::*;
@@ -628,7 +629,9 @@ mod tests {
   async fn resolve(pc: &TaskContext, path: &str) -> TaskId {
     let (tx, rx) = tokio::sync::oneshot::channel();
     pc.send(KernelCommand::Query(
-      KernelQuery::ResolvePath(TaskPath::new(path).unwrap()),
+      KernelQuery::ResolvePath(TaskKey::default_space(
+        TaskPath::new(path).unwrap(),
+      )),
       tx,
     ));
     let resp = tokio::time::timeout(Duration::from_secs(1), rx)

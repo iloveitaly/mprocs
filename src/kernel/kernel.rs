@@ -20,6 +20,7 @@ use super::{
     TaskDef, TaskEffect, TaskHandle, TaskId, TaskKind, TaskNotification,
     TaskNotify, TaskState,
   },
+  task_key::{TaskKey, TaskSpaceId},
   task_path::TaskPath,
 };
 
@@ -149,14 +150,18 @@ impl Graph {
     }
     // A taken path refuses the whole registration, checked before the
     // factory runs so a refused task spawns nothing.
+    let space = def.space.clone();
     let path = match def.path {
-      Some(p) => match self.ns.insert(&p, task_id) {
-        Ok(()) => Some(p),
-        Err(err) => {
-          log::warn!("Registration refused: {}", err);
-          return false;
+      Some(p) => {
+        let key = TaskKey::new(space.clone(), p.clone());
+        match self.ns.insert(&key, task_id) {
+          Ok(()) => Some(p),
+          Err(err) => {
+            log::warn!("Registration refused: {}", err);
+            return false;
+          }
         }
-      },
+      }
       None => None,
     };
     let ctx =
@@ -180,6 +185,7 @@ impl Graph {
       kind: def.kind,
       ready: def.ready,
       restart: def.restart,
+      space: space.clone(),
       path: path.clone(),
       label: def.label,
       vt: def.vt,
@@ -201,6 +207,7 @@ impl Graph {
 
     self.notify_subscribers(
       task_id,
+      space,
       path.clone(),
       TaskNotify::Added {
         path,
@@ -226,12 +233,29 @@ impl Graph {
     false
   }
 
-  fn subscribe(&mut self, subscriber: TaskId, path: TaskPath, mode: SubMode) {
-    self.ns.subscribe(subscriber, &path, mode);
+  fn subscribe(&mut self, subscriber: TaskId, key: TaskKey, mode: SubMode) {
+    self.ns.subscribe(subscriber, &key, mode);
   }
 
-  fn unsubscribe(&mut self, subscriber: TaskId, path: TaskPath, mode: SubMode) {
-    self.ns.unsubscribe(subscriber, &path, mode);
+  fn unsubscribe(&mut self, subscriber: TaskId, key: TaskKey, mode: SubMode) {
+    self.ns.unsubscribe(subscriber, &key, mode);
+  }
+
+  fn sender_space(&self, sender: TaskId) -> TaskSpaceId {
+    self
+      .tasks
+      .get(&sender)
+      .map_or_else(TaskSpaceId::default_space, |task| task.space.clone())
+  }
+
+  fn can_register(&self, sender: TaskId, space: &TaskSpaceId) -> bool {
+    !space.is_reserved() || self.sender_space(sender) == *space
+  }
+
+  fn can_mutate(&self, sender: TaskId, task_id: TaskId) -> bool {
+    self.tasks.get(&task_id).is_some_and(|task| {
+      !task.space.is_reserved() || self.sender_space(sender) == task.space
+    })
   }
 
   fn take_timers(&mut self) -> Vec<TimerRequest> {
@@ -943,6 +967,7 @@ impl Graph {
     task.epoch += 1;
     task.killed = false;
     let now_satisfied = task.is_satisfied();
+    let space = task.space.clone();
     let path = task.path.clone();
 
     #[cfg(test)]
@@ -970,7 +995,12 @@ impl Graph {
       }
     }
 
-    self.notify_subscribers(task_id, path, TaskNotify::StateChanged(state));
+    self.notify_subscribers(
+      task_id,
+      space,
+      path,
+      TaskNotify::StateChanged(state),
+    );
   }
 
   fn remove_task(&mut self, task_id: TaskId) {
@@ -986,7 +1016,9 @@ impl Graph {
       handle.task.handle_cmd(TaskCmd::Kill, &mut fx);
     }
     if let Some(path) = &handle.path {
-      self.ns.remove(path);
+      self
+        .ns
+        .remove(&TaskKey::new(handle.space.clone(), path.clone()));
     }
     for tag in &handle.tags {
       if let Some(set) = self.tags.get_mut(tag) {
@@ -1027,7 +1059,12 @@ impl Graph {
     }
 
     self.ns.remove_subscriber(task_id);
-    self.notify_subscribers(task_id, handle.path, TaskNotify::Removed);
+    self.notify_subscribers(
+      task_id,
+      handle.space,
+      handle.path,
+      TaskNotify::Removed,
+    );
   }
 
   fn set_task_label(&mut self, task_id: TaskId, label: Option<String>) {
@@ -1038,9 +1075,11 @@ impl Graph {
       return;
     }
     task.label = label.clone();
+    let space = task.space.clone();
     let from_path = task.path.clone();
     self.notify_subscribers(
       task_id,
+      space,
       from_path,
       TaskNotify::LabelChanged(label),
     );
@@ -1050,11 +1089,13 @@ impl Graph {
     if !self.tasks.contains_key(&task_id) {
       return;
     }
+    let space = self.tasks[&task_id].space.clone();
+    let key = TaskKey::new(space.clone(), path.clone());
     // Reject up front so the task never loses its current path: only free
     // the old one once the new one is known to be available.
     let taken_by_other = self
       .ns
-      .resolve(&path)
+      .resolve(&key)
       .is_some_and(|holder| holder != task_id);
     if taken_by_other {
       log::warn!("Path conflict: {} is already taken", path);
@@ -1067,14 +1108,14 @@ impl Graph {
       .path
       .take();
     if let Some(old) = &old_path {
-      self.ns.remove(old);
+      self.ns.remove(&TaskKey::new(space.clone(), old.clone()));
     }
-    match self.ns.insert(&path, task_id) {
+    match self.ns.insert(&key, task_id) {
       Ok(()) => {
         self.tasks.get_mut(&task_id).expect("checked above").path =
           Some(path.clone());
         if old_path.as_ref() != Some(&path) {
-          self.notify_path_changed(task_id, old_path, Some(path));
+          self.notify_path_changed(task_id, space, old_path, Some(path));
         }
       }
       Err(err) => {
@@ -1085,16 +1126,21 @@ impl Graph {
 
   // ---- Reads ----
 
-  fn list_tasks(&self, glob: Option<String>) -> Vec<TaskInfo> {
+  fn list_tasks(
+    &self,
+    space: &TaskSpaceId,
+    glob: Option<String>,
+  ) -> Vec<TaskInfo> {
     let entries = match &glob {
-      Some(pattern) => self.ns.glob(pattern),
-      None => self.ns.iter(),
+      Some(pattern) => self.ns.glob(space, pattern),
+      None => self.ns.iter(space),
     };
     entries
       .into_iter()
       .filter_map(|(path, id)| {
         self.tasks.get(&id).map(|handle| TaskInfo {
           id,
+          space: handle.space.clone(),
           path: Some(path),
           label: handle.label.clone(),
           state: handle.state,
@@ -1104,13 +1150,17 @@ impl Graph {
       .collect()
   }
 
-  fn resolve(&self, path: &TaskPath) -> Option<TaskId> {
-    self.ns.resolve(path)
+  fn resolve(&self, key: &TaskKey) -> Option<TaskId> {
+    self.ns.resolve(key)
   }
 
-  fn tasks_with_tag(&self, tag: &str) -> Vec<TaskId> {
+  fn tasks_with_tag(&self, space: &TaskSpaceId, tag: &str) -> Vec<TaskId> {
     match self.tags.get(tag) {
-      Some(set) => set.iter().copied().collect(),
+      Some(set) => set
+        .iter()
+        .filter(|id| self.tasks.get(id).is_some_and(|t| t.space == *space))
+        .copied()
+        .collect(),
       None => Vec::new(),
     }
   }
@@ -1121,31 +1171,43 @@ impl Graph {
         true => vec![*id],
         false => Vec::new(),
       },
-      TaskSelector::All => {
-        self.ns.iter().into_iter().map(|(_, id)| id).collect()
+      TaskSelector::All(space) => {
+        self.ns.iter(space).into_iter().map(|(_, id)| id).collect()
       }
-      TaskSelector::Glob(pattern) => self
+      TaskSelector::Glob(space, pattern) => self
         .ns
-        .glob(pattern)
+        .glob(space, pattern)
         .into_iter()
         .map(|(_, id)| id)
         .collect(),
-      TaskSelector::Tag(tag) => self.tasks_with_tag(tag),
+      TaskSelector::Tag(space, tag) => self.tasks_with_tag(space, tag),
     }
   }
 
-  fn screen(&self, path: &TaskPath) -> Option<String> {
+  fn mutable_matching_ids(
+    &self,
+    sender: TaskId,
+    selector: &TaskSelector,
+  ) -> Vec<TaskId> {
+    self
+      .matching_ids(selector)
+      .into_iter()
+      .filter(|id| self.can_mutate(sender, *id))
+      .collect()
+  }
+
+  fn screen(&self, key: &TaskKey) -> Option<String> {
     self
       .ns
-      .resolve(path)
+      .resolve(key)
       .and_then(|task_id| self.tasks.get(&task_id))
       .and_then(|handle| handle.vt.as_ref())
       .and_then(|vt| vt.read().ok())
       .map(|parser| crate::term::ansi::render_screen_ansi(parser.screen()))
   }
 
-  fn explain_at(&self, path: &TaskPath) -> Option<TaskExplain> {
-    self.ns.resolve(path).and_then(|id| self.explain(id))
+  fn explain_at(&self, key: &TaskKey) -> Option<TaskExplain> {
+    self.ns.resolve(key).and_then(|id| self.explain(id))
   }
 
   fn explain(&self, task_id: TaskId) -> Option<TaskExplain> {
@@ -1154,8 +1216,12 @@ impl Graph {
       self
         .tasks
         .get(&id)
-        .and_then(|t| t.path.as_ref())
-        .map(|p| p.to_string())
+        .and_then(|t| {
+          t.path
+            .as_ref()
+            .map(|p| TaskKey::new(t.space.clone(), p.clone()))
+        })
+        .map(|key| key.to_string())
         .unwrap_or_else(|| format!("<task:{}>", id.0))
     };
     let pinned = self
@@ -1214,19 +1280,24 @@ impl Graph {
   fn notify_subscribers(
     &mut self,
     from: TaskId,
+    from_space: TaskSpaceId,
     from_path: Option<TaskPath>,
     notify: TaskNotify,
   ) {
     let mut targets = HashSet::new();
     if let Some(path) = &from_path {
-      self.ns.collect(path, &mut targets);
+      self.ns.collect(
+        &TaskKey::new(from_space.clone(), path.clone()),
+        &mut targets,
+      );
     }
-    self.deliver(from, from_path, notify, targets);
+    self.deliver(from, from_space, from_path, notify, targets);
   }
 
   fn notify_path_changed(
     &mut self,
     from: TaskId,
+    space: TaskSpaceId,
     old: Option<TaskPath>,
     new: Option<TaskPath>,
   ) {
@@ -1235,11 +1306,15 @@ impl Graph {
 
     let mut old_targets = HashSet::new();
     if let Some(old) = &old {
-      self.ns.collect(old, &mut old_targets);
+      self
+        .ns
+        .collect(&TaskKey::new(space.clone(), old.clone()), &mut old_targets);
     }
     let mut new_targets = HashSet::new();
     if let Some(new) = &new {
-      self.ns.collect(new, &mut new_targets);
+      self
+        .ns
+        .collect(&TaskKey::new(space.clone(), new.clone()), &mut new_targets);
     }
 
     let entering: HashSet<TaskId> =
@@ -1252,6 +1327,7 @@ impl Graph {
     if let Some(new) = &new {
       self.deliver(
         from,
+        space.clone(),
         Some(new.clone()),
         TaskNotify::Added {
           path: Some(new.clone()),
@@ -1262,9 +1338,16 @@ impl Graph {
         entering,
       );
     }
-    self.deliver(from, old.clone(), TaskNotify::Removed, leaving);
     self.deliver(
       from,
+      space.clone(),
+      old.clone(),
+      TaskNotify::Removed,
+      leaving,
+    );
+    self.deliver(
+      from,
+      space,
       new.clone().or_else(|| old.clone()),
       TaskNotify::PathChanged(old, new),
       staying,
@@ -1274,6 +1357,7 @@ impl Graph {
   fn deliver(
     &mut self,
     from: TaskId,
+    from_space: TaskSpaceId,
     from_path: Option<TaskPath>,
     notify: TaskNotify,
     targets: HashSet<TaskId>,
@@ -1284,6 +1368,7 @@ impl Graph {
         listener.task.handle_cmd(
           TaskCmd::msg(TaskNotification {
             from,
+            from_space: from_space.clone(),
             from_path: from_path.clone(),
             notify: notify.clone(),
           }),
@@ -1367,16 +1452,23 @@ impl Kernel {
       KernelCommand::Quit => return self.graph.begin_quit(),
 
       KernelCommand::RegisterTask(task_id, def, factory, ack) => {
-        let registered =
-          self.graph.register_task_with_id(task_id, def, factory);
+        let registered = if self.graph.can_register(msg.from, &def.space) {
+          self.graph.register_task_with_id(task_id, def, factory)
+        } else {
+          false
+        };
         if let Some(ack) = ack {
           let _ = ack.send(registered);
         }
       }
-      KernelCommand::RemoveTask(task_id) => self.graph.remove_task(task_id),
+      KernelCommand::RemoveTask(task_id) => {
+        if self.graph.can_mutate(msg.from, task_id) {
+          self.graph.remove_task(task_id);
+        }
+      }
 
       KernelCommand::Start(selector, ack) => {
-        let ids = self.graph.matching_ids(&selector);
+        let ids = self.graph.mutable_matching_ids(msg.from, &selector);
         for id in &ids {
           self.graph.cmd_start(*id);
         }
@@ -1385,7 +1477,7 @@ impl Kernel {
         }
       }
       KernelCommand::Stop(selector, ack) => {
-        let ids = self.graph.matching_ids(&selector);
+        let ids = self.graph.mutable_matching_ids(msg.from, &selector);
         for id in &ids {
           self.graph.cmd_stop(*id);
         }
@@ -1394,7 +1486,7 @@ impl Kernel {
         }
       }
       KernelCommand::Kill(selector, ack) => {
-        let ids = self.graph.matching_ids(&selector);
+        let ids = self.graph.mutable_matching_ids(msg.from, &selector);
         for id in &ids {
           self.graph.cmd_kill(*id);
         }
@@ -1403,7 +1495,7 @@ impl Kernel {
         }
       }
       KernelCommand::Restart(selector, ack) => {
-        let ids = self.graph.matching_ids(&selector);
+        let ids = self.graph.mutable_matching_ids(msg.from, &selector);
         for id in &ids {
           self.graph.cmd_restart(*id);
         }
@@ -1412,7 +1504,7 @@ impl Kernel {
         }
       }
       KernelCommand::Down(selector, ack) => {
-        let ids = self.graph.matching_ids(&selector);
+        let ids = self.graph.mutable_matching_ids(msg.from, &selector);
         for id in &ids {
           self.graph.remove_edge(INIT_TASK_ID, *id);
         }
@@ -1421,7 +1513,7 @@ impl Kernel {
         }
       }
       KernelCommand::Veto(selector, ack) => {
-        let ids = self.graph.matching_ids(&selector);
+        let ids = self.graph.mutable_matching_ids(msg.from, &selector);
         for id in &ids {
           self.graph.cmd_veto(*id);
         }
@@ -1429,9 +1521,15 @@ impl Kernel {
           let _ = ack.send(ids.len());
         }
       }
-      KernelCommand::AddEdge { from, to } => self.graph.add_edge(from, to),
+      KernelCommand::AddEdge { from, to } => {
+        if self.graph.can_mutate(msg.from, from) {
+          self.graph.add_edge(from, to);
+        }
+      }
       KernelCommand::RemoveEdge { from, to } => {
-        self.graph.remove_edge(from, to)
+        if self.graph.can_mutate(msg.from, from) {
+          self.graph.remove_edge(from, to)
+        }
       }
 
       KernelCommand::TaskMsg(task_id, m) => {
@@ -1439,10 +1537,14 @@ impl Kernel {
       }
 
       KernelCommand::SetTaskPath(task_id, path) => {
-        self.graph.set_task_path(task_id, path);
+        if self.graph.can_mutate(msg.from, task_id) {
+          self.graph.set_task_path(task_id, path);
+        }
       }
       KernelCommand::SetTaskLabel(task_id, label) => {
-        self.graph.set_task_label(task_id, label);
+        if self.graph.can_mutate(msg.from, task_id) {
+          self.graph.set_task_label(task_id, label);
+        }
       }
 
       KernelCommand::Query(query, response_tx) => {
@@ -1471,20 +1573,22 @@ impl Kernel {
 
   fn handle_query(&self, query: KernelQuery) -> KernelQueryResponse {
     match query {
-      KernelQuery::ListTasks(glob) => {
-        KernelQueryResponse::TaskList(self.graph.list_tasks(glob))
+      KernelQuery::ListTasks(space, glob) => {
+        KernelQueryResponse::TaskList(self.graph.list_tasks(&space, glob))
       }
-      KernelQuery::ResolvePath(path) => {
-        KernelQueryResponse::ResolvedPath(self.graph.resolve(&path))
+      KernelQuery::ResolvePath(key) => {
+        KernelQueryResponse::ResolvedPath(self.graph.resolve(&key))
       }
-      KernelQuery::TasksWithTag(tag) => {
-        KernelQueryResponse::TaggedTasks(self.graph.tasks_with_tag(&tag))
+      KernelQuery::TasksWithTag(space, tag) => {
+        KernelQueryResponse::TaggedTasks(
+          self.graph.tasks_with_tag(&space, &tag),
+        )
       }
-      KernelQuery::GetScreen(path) => {
-        KernelQueryResponse::Screen(self.graph.screen(&path))
+      KernelQuery::GetScreen(key) => {
+        KernelQueryResponse::Screen(self.graph.screen(&key))
       }
-      KernelQuery::Explain(path) => {
-        KernelQueryResponse::Explain(self.graph.explain_at(&path))
+      KernelQuery::Explain(key) => {
+        KernelQueryResponse::Explain(self.graph.explain_at(&key))
       }
     }
   }
@@ -1675,7 +1779,9 @@ mod tests {
 
     /// Round-trip a query so all previously sent messages are processed.
     async fn flush(&self) {
-      let rx = self.pc.query(KernelQuery::ListTasks(None));
+      let rx = self
+        .pc
+        .query(KernelQuery::ListTasks(TaskSpaceId::default_space(), None));
       tokio::time::timeout(Duration::from_secs(1), rx)
         .await
         .expect("timed out waiting for kernel query response")
@@ -2188,7 +2294,12 @@ mod tests {
     );
     assert!(!registered);
     assert!(!kernel.graph.tasks.contains_key(&app_id));
-    assert_eq!(kernel.graph.resolve(&TaskPath::new("app").unwrap()), None);
+    assert_eq!(
+      kernel
+        .graph
+        .resolve(&TaskKey::default_space(TaskPath::new("app").unwrap())),
+      None
+    );
 
     // Dep first, then the app registers and starts behind it.
     let tx = fx.tx.clone();
@@ -2244,7 +2355,8 @@ mod tests {
   }
 
   async fn label_of(pc: &TaskContext, id: TaskId) -> Option<String> {
-    let rx = pc.query(KernelQuery::ListTasks(None));
+    let rx =
+      pc.query(KernelQuery::ListTasks(TaskSpaceId::default_space(), None));
     let resp = tokio::time::timeout(Duration::from_secs(1), rx)
       .await
       .expect("timed out listing tasks")
@@ -2280,7 +2392,8 @@ mod tests {
   }
 
   async fn state_of(pc: &TaskContext, id: TaskId) -> Option<TaskState> {
-    let rx = pc.query(KernelQuery::ListTasks(None));
+    let rx =
+      pc.query(KernelQuery::ListTasks(TaskSpaceId::default_space(), None));
     let resp = tokio::time::timeout(Duration::from_secs(1), rx)
       .await
       .expect("timed out listing tasks")
@@ -2294,7 +2407,9 @@ mod tests {
   }
 
   async fn resolve(pc: &TaskContext, path: &str) -> Option<TaskId> {
-    let rx = pc.query(KernelQuery::ResolvePath(TaskPath::new(path).unwrap()));
+    let rx = pc.query(KernelQuery::ResolvePath(TaskKey::default_space(
+      TaskPath::new(path).unwrap(),
+    )));
     let resp = tokio::time::timeout(Duration::from_secs(1), rx)
       .await
       .expect("timed out resolving path")
@@ -2823,7 +2938,10 @@ mod tests {
         ..path_def("j")
       },
       move |ctx| {
-        ctx.subscribe_path(TaskPath::new("d").unwrap(), SubMode::Subtree);
+        ctx.subscribe_path(
+          TaskKey::default_space(TaskPath::new("d").unwrap()),
+          SubMode::Subtree,
+        );
         Box::new(ExitOnNotify { name: "j", tx })
       },
     );
@@ -2870,9 +2988,9 @@ mod tests {
       .send(KernelCommand::Start(TaskSelector::Id(app), None));
     assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
 
-    let rx = fx
-      .pc
-      .query(KernelQuery::Explain(TaskPath::new("app").unwrap()));
+    let rx = fx.pc.query(KernelQuery::Explain(TaskKey::default_space(
+      TaskPath::new("app").unwrap(),
+    )));
     let resp = tokio::time::timeout(Duration::from_secs(1), rx)
       .await
       .unwrap()
@@ -2940,7 +3058,10 @@ mod tests {
     let mut kernel = fx.kernel.take().unwrap();
 
     let n = turn_matching(&mut kernel, |ack| {
-      KernelCommand::Start(TaskSelector::Glob("a".to_string()), ack)
+      KernelCommand::Start(
+        TaskSelector::Glob(TaskSpaceId::default_space(), "a".to_string()),
+        ack,
+      )
     });
     assert_eq!(n, 1);
     assert!(pinned(&kernel, a));
@@ -2948,7 +3069,10 @@ mod tests {
     assert!(!pinned(&kernel, b));
 
     let n = turn_matching(&mut kernel, |ack| {
-      KernelCommand::Start(TaskSelector::Glob("*".to_string()), ack)
+      KernelCommand::Start(
+        TaskSelector::Glob(TaskSpaceId::default_space(), "*".to_string()),
+        ack,
+      )
     });
     assert_eq!(n, 3);
     assert!(pinned(&kernel, ab));
@@ -2964,7 +3088,10 @@ mod tests {
     let mut kernel = fx.kernel.take().unwrap();
 
     let n = turn_matching(&mut kernel, |ack| {
-      KernelCommand::Start(TaskSelector::Tag("web".to_string()), ack)
+      KernelCommand::Start(
+        TaskSelector::Tag(TaskSpaceId::default_space(), "web".to_string()),
+        ack,
+      )
     });
     assert_eq!(n, 2);
     assert!(pinned(&kernel, a));
@@ -2972,14 +3099,17 @@ mod tests {
     assert!(!pinned(&kernel, c));
 
     let n = turn_matching(&mut kernel, |ack| {
-      KernelCommand::Down(TaskSelector::All, ack)
+      KernelCommand::Down(TaskSelector::All(TaskSpaceId::default_space()), ack)
     });
     assert_eq!(n, 3);
     assert!(!pinned(&kernel, a));
     assert!(!pinned(&kernel, b));
 
     let n = turn_matching(&mut kernel, |ack| {
-      KernelCommand::Start(TaskSelector::Tag("nope".to_string()), ack)
+      KernelCommand::Start(
+        TaskSelector::Tag(TaskSpaceId::default_space(), "nope".to_string()),
+        ack,
+      )
     });
     assert_eq!(n, 0);
     assert!(!pinned(&kernel, a));
@@ -3050,7 +3180,7 @@ mod tests {
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     fx.pc.send(KernelCommand::Start(
-      TaskSelector::Tag("web".to_string()),
+      TaskSelector::Tag(TaskSpaceId::default_space(), "web".to_string()),
       Some(tx),
     ));
     assert_eq!(rx.await.unwrap(), 2);
@@ -3065,6 +3195,152 @@ mod tests {
     fx.assert_no_cmd();
 
     fx.quit(handle).await;
+  }
+
+  #[tokio::test]
+  async fn spaces_keep_paths_separate() {
+    let mut kernel = Kernel::new();
+    let pc = kernel.context();
+    let default_id = kernel.register_task(path_def("same"), |_| {
+      Box::new(crate::kernel::task::TargetTask)
+    });
+    let mut dekit_def = path_def("same");
+    dekit_def.space = TaskSpaceId::dekit();
+    let dekit_id = kernel
+      .register_task(dekit_def, |_| Box::new(crate::kernel::task::TargetTask));
+    let handle = tokio::spawn(kernel.run());
+
+    let default = pc
+      .query(KernelQuery::ListTasks(TaskSpaceId::default_space(), None))
+      .await
+      .unwrap();
+    let KernelQueryResponse::TaskList(default) = default else {
+      panic!("unexpected response");
+    };
+    assert_eq!(default.len(), 1);
+    assert_eq!(default[0].id, default_id);
+
+    let dekit = pc
+      .query(KernelQuery::ListTasks(TaskSpaceId::dekit(), None))
+      .await
+      .unwrap();
+    let KernelQueryResponse::TaskList(dekit) = dekit else {
+      panic!("unexpected response");
+    };
+    assert_eq!(dekit.len(), 1);
+    assert_eq!(dekit[0].id, dekit_id);
+
+    pc.send(KernelCommand::Quit);
+    handle.await.unwrap();
+  }
+
+  #[test]
+  fn selectors_are_space_local() {
+    let mut kernel = Kernel::new();
+    let mut default_def = path_def("same");
+    default_def.tags.push("tagged".to_string());
+    let default_id = kernel.register_task(default_def, |_| {
+      Box::new(crate::kernel::task::TargetTask)
+    });
+    let mut dekit_def = path_def("same");
+    dekit_def.tags.push("tagged".to_string());
+    dekit_def.space = TaskSpaceId::dekit();
+    let dekit_id = kernel
+      .register_task(dekit_def, |_| Box::new(crate::kernel::task::TargetTask));
+
+    assert_eq!(
+      kernel.graph.matching_ids(&TaskSelector::Tag(
+        TaskSpaceId::default_space(),
+        "tagged".to_string(),
+      )),
+      vec![default_id]
+    );
+    assert_eq!(
+      kernel.graph.matching_ids(&TaskSelector::Glob(
+        TaskSpaceId::dekit(),
+        "same".to_string(),
+      )),
+      vec![dekit_id]
+    );
+  }
+
+  #[tokio::test]
+  async fn default_context_cannot_register_reserved_task() {
+    let kernel = Kernel::new();
+    let pc = kernel.context();
+    let handle = tokio::spawn(kernel.run());
+    let task_id = pc.alloc_id();
+    let ack = pc.spawn_async_with_id(
+      task_id,
+      TaskDef {
+        space: TaskSpaceId::dekit(),
+        path: Some(TaskPath::new("console").unwrap()),
+        ..Default::default()
+      },
+      |_, _| async {},
+    );
+
+    assert!(!ack.await.unwrap());
+    let resolved = pc
+      .query(KernelQuery::ResolvePath(TaskKey::new(
+        TaskSpaceId::dekit(),
+        TaskPath::new("console").unwrap(),
+      )))
+      .await
+      .unwrap();
+    assert!(matches!(resolved, KernelQueryResponse::ResolvedPath(None)));
+
+    pc.send(KernelCommand::Quit);
+    handle.await.unwrap();
+  }
+
+  #[tokio::test]
+  async fn reserved_task_controls_its_space() {
+    let mut kernel = Kernel::new();
+    let pc = kernel.context();
+    let mut provider_def = path_def("console");
+    provider_def.space = TaskSpaceId::dekit();
+    let provider = kernel.register_task(provider_def, |_| {
+      Box::new(crate::kernel::task::TargetTask)
+    });
+    let provider_pc = TaskContext::new(
+      kernel.graph.next_task_id.clone(),
+      provider,
+      kernel.sender.clone(),
+    );
+    let handle = tokio::spawn(kernel.run());
+
+    pc.send(KernelCommand::RemoveTask(provider));
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    pc.send(KernelCommand::Start(TaskSelector::Id(provider), Some(tx)));
+    assert_eq!(rx.await.unwrap(), 0);
+    let key =
+      TaskKey::new(TaskSpaceId::dekit(), TaskPath::new("console").unwrap());
+    assert!(matches!(
+      pc.query(KernelQuery::ResolvePath(key.clone())).await.unwrap(),
+      KernelQueryResponse::ResolvedPath(Some(id)) if id == provider
+    ));
+
+    let child = provider_pc.alloc_id();
+    let ack = provider_pc.spawn_async_with_id(
+      child,
+      TaskDef {
+        space: TaskSpaceId::dekit(),
+        path: Some(TaskPath::new("consoles/main").unwrap()),
+        ..Default::default()
+      },
+      |_, mut rx| async move { while rx.recv().await.is_some() {} },
+    );
+    assert!(ack.await.unwrap());
+    provider_pc.send(KernelCommand::RemoveTask(child));
+    provider_pc.send(KernelCommand::RemoveTask(provider));
+    assert!(matches!(
+      pc.query(KernelQuery::ResolvePath(key)).await.unwrap(),
+      KernelQueryResponse::ResolvedPath(None)
+    ));
+
+    pc.send(KernelCommand::Quit);
+    handle.await.unwrap();
   }
 }
 

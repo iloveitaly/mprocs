@@ -5,5 +5,6 @@ pub mod namespace;
 pub mod path_trie;
 pub mod sub_trie;
 pub mod task;
+pub mod task_key;
 pub mod task_path;
 pub mod task_screen;

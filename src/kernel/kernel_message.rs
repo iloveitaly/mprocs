@@ -11,6 +11,7 @@ use crate::term::Parser;
 
 use super::sub_trie::SubMode;
 use super::task::{ExitInfo, Task, TaskCmd, TaskDef, TaskId, TaskState};
+use super::task_key::{TaskKey, TaskSpaceId};
 use super::task_path::TaskPath;
 
 pub struct KernelMessage {
@@ -61,8 +62,8 @@ pub enum KernelCommand {
     tokio::sync::oneshot::Sender<KernelQueryResponse>,
   ),
 
-  SubscribePath(TaskPath, SubMode),
-  UnsubscribePath(TaskPath, SubMode),
+  SubscribePath(TaskKey, SubMode),
+  UnsubscribePath(TaskKey, SubMode),
 
   // Task reporting
   TaskStarted,
@@ -79,23 +80,23 @@ pub enum KernelCommand {
 pub enum TaskSelector {
   Id(TaskId),
   /// Every task with a path.
-  All,
-  Glob(String),
+  All(TaskSpaceId),
+  Glob(TaskSpaceId, String),
   /// Tasks carrying the tag.
-  Tag(String),
+  Tag(TaskSpaceId, String),
 }
 
 pub enum KernelQuery {
   /// List tasks matching an optional glob. None = list all.
-  ListTasks(Option<String>),
+  ListTasks(TaskSpaceId, Option<String>),
   /// Resolve a path to a TaskId.
-  ResolvePath(TaskPath),
+  ResolvePath(TaskKey),
   /// List the task ids carrying a tag.
-  TasksWithTag(String),
+  TasksWithTag(TaskSpaceId, String),
   /// Get the current screen content for a task (rendered as ANSI text).
-  GetScreen(TaskPath),
+  GetScreen(TaskKey),
   /// Explain why a task is (not) running.
-  Explain(TaskPath),
+  Explain(TaskKey),
 }
 
 pub enum KernelQueryResponse {
@@ -110,6 +111,7 @@ pub enum KernelQueryResponse {
 #[derive(Clone, Debug)]
 pub struct TaskInfo {
   pub id: TaskId,
+  pub space: TaskSpaceId,
   pub path: Option<TaskPath>,
   pub label: Option<String>,
   pub state: TaskState,
@@ -276,12 +278,12 @@ impl TaskContext {
     self.send(KernelCommand::SetTaskLabel(task_id, label));
   }
 
-  pub fn subscribe_path(&self, path: TaskPath, mode: SubMode) {
-    self.send(KernelCommand::SubscribePath(path, mode));
+  pub fn subscribe_path(&self, key: TaskKey, mode: SubMode) {
+    self.send(KernelCommand::SubscribePath(key, mode));
   }
 
-  pub fn unsubscribe_path(&self, path: TaskPath, mode: SubMode) {
-    self.send(KernelCommand::UnsubscribePath(path, mode));
+  pub fn unsubscribe_path(&self, key: TaskKey, mode: SubMode) {
+    self.send(KernelCommand::UnsubscribePath(key, mode));
   }
 
   pub fn query(

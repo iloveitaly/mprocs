@@ -17,6 +17,7 @@ use crate::kernel::task::{
   Effects, ExitInfo, INIT_TASK_ID, ReadyMode, RestartMode, Task, TaskCmd,
   TaskDef, TaskId, TaskKind, TaskState,
 };
+use crate::kernel::task_key::{TaskKey, TaskSpaceId};
 use crate::kernel::task_path::TaskPath;
 
 // ---- Generated world ----
@@ -309,6 +310,7 @@ impl Run {
       restart: task.restart,
       deps: task.deps.iter().map(|d| TaskId(d + 1)).collect(),
       pinned: task.pinned,
+      space: TaskSpaceId::default_space(),
       path: Some(TaskPath::new(format!("t{}", i + 1)).unwrap()),
       label: None,
       vt: None,
@@ -357,12 +359,18 @@ impl Run {
     let n = world.tasks.len();
     match sel {
       Sel::Id(k) => TaskSelector::Id(TaskId((k % n) + 1)),
-      Sel::All => TaskSelector::All,
-      Sel::Exact(k) => TaskSelector::Glob(format!("t{}", (k % n) + 1)),
-      Sel::Wild => TaskSelector::Glob("*".to_string()),
-      Sel::Tag(even) => {
-        TaskSelector::Tag(if *even { "even" } else { "odd" }.to_string())
+      Sel::All => TaskSelector::All(TaskSpaceId::default_space()),
+      Sel::Exact(k) => TaskSelector::Glob(
+        TaskSpaceId::default_space(),
+        format!("t{}", (k % n) + 1),
+      ),
+      Sel::Wild => {
+        TaskSelector::Glob(TaskSpaceId::default_space(), "*".to_string())
       }
+      Sel::Tag(even) => TaskSelector::Tag(
+        TaskSpaceId::default_space(),
+        if *even { "even" } else { "odd" }.to_string(),
+      ),
     }
   }
 
@@ -499,7 +507,13 @@ impl Run {
       }
       Cmd::Subscribe(a, b) => {
         let path = TaskPath::new(format!("t{}", (b % n) + 1)).unwrap();
-        self.turn(id(*a), KernelCommand::SubscribePath(path, SubMode::Subtree));
+        self.turn(
+          id(*a),
+          KernelCommand::SubscribePath(
+            TaskKey::default_space(path),
+            SubMode::Subtree,
+          ),
+        );
       }
       Cmd::Report(t, kind) => {
         let command = match kind {

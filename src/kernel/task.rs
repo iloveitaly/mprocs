@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::kernel_message::SharedVt;
+use super::task_key::TaskSpaceId;
 use super::task_path::TaskPath;
 
 #[derive(
@@ -182,6 +183,7 @@ pub enum RestartMode {
 
 pub struct TaskNotification {
   pub from: TaskId,
+  pub from_space: TaskSpaceId,
   pub from_path: Option<TaskPath>,
   pub notify: TaskNotify,
 }
@@ -284,6 +286,7 @@ pub struct TaskHandle {
   pub ready: ReadyMode,
   pub restart: RestartMode,
 
+  pub space: TaskSpaceId,
   pub path: Option<TaskPath>,
   pub label: Option<String>,
   pub vt: Option<SharedVt>,
@@ -316,6 +319,7 @@ pub struct TaskDef {
   pub deps: Vec<TaskId>,
   /// aka autostart
   pub pinned: bool,
+  pub space: TaskSpaceId,
   pub path: Option<TaskPath>,
   pub label: Option<String>,
   pub vt: Option<SharedVt>,
@@ -330,6 +334,7 @@ impl Default for TaskDef {
       restart: RestartMode::Never,
       deps: Vec::new(),
       pinned: false,
+      space: TaskSpaceId::default_space(),
       path: None,
       label: None,
       vt: None,

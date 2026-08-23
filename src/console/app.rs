@@ -41,6 +41,7 @@ use crate::{
     task::{
       RestartMode, TaskCmd, TaskDef, TaskId, TaskNotification, TaskNotify,
     },
+    task_key::{TaskKey, TaskSpaceId},
     task_path::TaskPath,
     task_screen::{
       FramedScreenNotify, ScrollUnit as KernelScrollUnit, TaskScreenCmd,
@@ -127,7 +128,10 @@ impl App {
   }
 
   async fn main_loop(mut self) -> anyhow::Result<()> {
-    self.pc.subscribe_path(TaskPath::root(), SubMode::Subtree);
+    self.pc.subscribe_path(
+      TaskKey::default_space(TaskPath::root()),
+      SubMode::Subtree,
+    );
     self.refresh_tasks().await;
 
     self.start_tasks()?;
@@ -231,7 +235,10 @@ impl App {
         },
       );
     }
-    self.pc.unsubscribe_path(TaskPath::root(), SubMode::Subtree);
+    self.pc.unsubscribe_path(
+      TaskKey::default_space(TaskPath::root()),
+      SubMode::Subtree,
+    );
 
     Ok(())
   }
@@ -253,7 +260,10 @@ impl App {
   }
 
   async fn refresh_tasks(&mut self) {
-    let resp = self.pc.query(KernelQuery::ListTasks(None)).await;
+    let resp = self
+      .pc
+      .query(KernelQuery::ListTasks(TaskSpaceId::default_space(), None))
+      .await;
     let Ok(KernelQueryResponse::TaskList(list)) = resp else {
       return;
     };

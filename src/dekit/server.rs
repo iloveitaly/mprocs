@@ -14,6 +14,7 @@ use crate::{
       TaskSelector,
     },
     task::TaskState,
+    task_key::{TaskKey, TaskSpaceId},
     task_path::TaskPath,
   },
   protocol::{
@@ -185,10 +186,16 @@ fn task_state(state: TaskState) -> RpcState {
 
 fn parse_selector(pattern: &str) -> Result<TaskSelector, RpcError> {
   match pattern.strip_prefix('#') {
-    Some(tag) => Ok(TaskSelector::Tag(tag.to_string())),
+    Some(tag) => Ok(TaskSelector::Tag(
+      TaskSpaceId::default_space(),
+      tag.to_string(),
+    )),
     None => {
       parse_glob(pattern)?;
-      Ok(TaskSelector::Glob(pattern.to_string()))
+      Ok(TaskSelector::Glob(
+        TaskSpaceId::default_space(),
+        pattern.to_string(),
+      ))
     }
   }
 }
@@ -209,7 +216,12 @@ async fn list_tasks(
   pc: &TaskContext,
   glob: Option<String>,
 ) -> Result<Vec<TaskInfo>, RpcError> {
-  match query(pc, KernelQuery::ListTasks(glob)).await? {
+  match query(
+    pc,
+    KernelQuery::ListTasks(TaskSpaceId::default_space(), glob),
+  )
+  .await?
+  {
     KernelQueryResponse::TaskList(tasks) => Ok(tasks),
     _ => Err(RpcError::internal("unexpected query response")),
   }
@@ -267,9 +279,10 @@ async fn handle_rpc(
     RpcRequest::Up { pattern } => {
       let selector = match pattern {
         Some(pattern) => parse_selector(&pattern)?,
-        None => {
-          TaskSelector::Tag(crate::config::task::AUTOSTART_TAG.to_string())
-        }
+        None => TaskSelector::Tag(
+          TaskSpaceId::default_space(),
+          crate::config::task::AUTOSTART_TAG.to_string(),
+        ),
       };
       let matched =
         act_matching(pc, |ack| KernelCommand::Start(selector, ack)).await?;
@@ -300,7 +313,7 @@ async fn handle_rpc(
     RpcRequest::Down { pattern } => {
       let selector = match pattern {
         Some(pattern) => parse_selector(&pattern)?,
-        None => TaskSelector::All,
+        None => TaskSelector::All(TaskSpaceId::default_space()),
       };
       let matched =
         act_matching(pc, |ack| KernelCommand::Down(selector, ack)).await?;
@@ -323,7 +336,9 @@ async fn handle_rpc(
 
     RpcRequest::Why { path } => {
       let task_path = parse_path(&path)?;
-      match query(pc, KernelQuery::Explain(task_path)).await? {
+      match query(pc, KernelQuery::Explain(TaskKey::default_space(task_path)))
+        .await?
+      {
         KernelQueryResponse::Explain(Some(explain)) => {
           let why = RpcWhy {
             path,
@@ -357,7 +372,12 @@ async fn handle_rpc(
 
     RpcRequest::Screen { path } => {
       let task_path = parse_path(&path)?;
-      match query(pc, KernelQuery::GetScreen(task_path)).await? {
+      match query(
+        pc,
+        KernelQuery::GetScreen(TaskKey::default_space(task_path)),
+      )
+      .await?
+      {
         KernelQueryResponse::Screen(Some(content)) => {
           serde_json::to_value(crate::protocol::ScreenResult {
             screen: Some(content),
@@ -397,7 +417,12 @@ async fn handle_rpc(
       let mut dep_ids = Vec::with_capacity(deps.len());
       for dep in &deps {
         let dep_path = parse_path(dep)?;
-        match query(pc, KernelQuery::ResolvePath(dep_path)).await? {
+        match query(
+          pc,
+          KernelQuery::ResolvePath(TaskKey::default_space(dep_path)),
+        )
+        .await?
+        {
           KernelQueryResponse::ResolvedPath(Some(id)) => dep_ids.push(id),
           KernelQueryResponse::ResolvedPath(None) => {
             return Err(RpcError::new(
