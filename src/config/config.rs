@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 
 use crate::cfg::{CfgCx, CfgDoc, CfgObj};
-use crate::config::hook::{Hook, event_from_cfg};
+use crate::config::hook::{Hook, hook_from_cfg};
 use crate::config::keymap::KeymapConfig;
 use crate::config::log::LogConfig;
 use crate::config::task::{TaskConfig, parse_task_settings, task_from_cfg};
@@ -103,10 +103,10 @@ impl Config {
     }
     self.tui.merge(obj, cx)?;
     self.keymap.merge(obj)?;
-    if let Some(hook) = event_from_cfg(obj, "on_init")? {
+    if let Some(hook) = hook_from_cfg(obj, "on_init")? {
       self.on_init = Some(hook);
     }
-    if let Some(hook) = event_from_cfg(obj, "on_all_finished")? {
+    if let Some(hook) = hook_from_cfg(obj, "on_all_finished")? {
       self.on_all_finished = Some(hook);
     }
     Ok(())

@@ -25,7 +25,7 @@ use std::ffi::OsString;
 use std::fmt::{self, Display};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use indexmap::IndexMap;
 use serde_yaml::Value;
 

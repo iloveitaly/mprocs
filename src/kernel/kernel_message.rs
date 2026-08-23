@@ -60,6 +60,7 @@ pub enum KernelCommand {
   Stop(TaskSelector, Option<tokio::sync::oneshot::Sender<usize>>),
   Kill(TaskSelector, Option<tokio::sync::oneshot::Sender<usize>>),
   Restart(TaskSelector, Option<tokio::sync::oneshot::Sender<usize>>),
+  ForceRestart(TaskSelector, Option<tokio::sync::oneshot::Sender<usize>>),
   Down(TaskSelector, Option<tokio::sync::oneshot::Sender<usize>>),
   Veto(TaskSelector, Option<tokio::sync::oneshot::Sender<usize>>),
   /// `from` requires `to`.

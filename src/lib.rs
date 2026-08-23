@@ -1,6 +1,7 @@
 mod attach_client;
 mod cfg;
 mod clipboard;
+mod command;
 mod config;
 mod console;
 mod daemon;

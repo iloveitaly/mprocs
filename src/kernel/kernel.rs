@@ -1506,6 +1506,16 @@ impl Kernel {
           let _ = ack.send(ids.len());
         }
       }
+      KernelCommand::ForceRestart(selector, ack) => {
+        let ids = self.graph.mutable_matching_ids(msg.from, &selector);
+        for id in &ids {
+          self.graph.cmd_kill(*id);
+          self.graph.cmd_start(*id);
+        }
+        if let Some(ack) = ack {
+          let _ = ack.send(ids.len());
+        }
+      }
       KernelCommand::Down(selector, ack) => {
         let ids = self.graph.mutable_matching_ids(msg.from, &selector);
         for id in &ids {

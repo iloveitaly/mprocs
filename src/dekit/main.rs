@@ -192,10 +192,10 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         ),
       Command::new("up")
         .about("Start autostart tasks, or tasks matching a pattern")
-        .arg(Arg::new("pattern").help("Task path, glob, or #tag")),
+        .arg(Arg::new("pattern").help("Task path, glob, or +tag")),
       Command::new("down")
         .about("Unpin tasks (bare: all); each stops unless something still needs it")
-        .arg(Arg::new("pattern").help("Task path, glob, or #tag")),
+        .arg(Arg::new("pattern").help("Task path, glob, or +tag")),
       Command::new("spawn")
         .about("Add a task at a path and start it")
         .arg(
@@ -238,19 +238,19 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         .arg(Arg::new("pattern").help("Optional path or glob")),
       Command::new("start")
         .about("Start tasks matching a path or glob")
-        .arg(Arg::new("pattern").required(true).help("Task path, glob, or #tag")),
+        .arg(Arg::new("pattern").required(true).help("Task path, glob, or +tag")),
       Command::new("stop")
         .about("Unpin and stop tasks; each restarts if something still needs it")
-        .arg(Arg::new("pattern").required(true).help("Task path, glob, or #tag")),
+        .arg(Arg::new("pattern").required(true).help("Task path, glob, or +tag")),
       Command::new("kill")
         .about("Like stop, but with an immediate hard kill")
-        .arg(Arg::new("pattern").required(true).help("Task path, glob, or #tag")),
+        .arg(Arg::new("pattern").required(true).help("Task path, glob, or +tag")),
       Command::new("veto")
         .about("Force tasks down and keep them down until started again")
-        .arg(Arg::new("pattern").required(true).help("Task path, glob, or #tag")),
+        .arg(Arg::new("pattern").required(true).help("Task path, glob, or +tag")),
       Command::new("restart")
         .about("Restart tasks matching a path or glob")
-        .arg(Arg::new("pattern").required(true).help("Task path, glob, or #tag")),
+        .arg(Arg::new("pattern").required(true).help("Task path, glob, or +tag")),
       Command::new("why")
         .about("Explain why a task is (not) running")
         .arg(Arg::new("path").required(true).help("Task path")),
@@ -314,7 +314,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
     .after_help(
       "SELECTORS\n  \
        A pattern is a task path (services/web), a glob (services/*), or\n  \
-       a #tag (#backend). The surgical verbs (start, stop, kill, veto,\n  \
+       a +tag (+backend). The surgical verbs (start, stop, kill, veto,\n  \
        restart) require a pattern; the workday verbs (up, down) default to\n  \
        the autostart set / everything.\n\
        \n\

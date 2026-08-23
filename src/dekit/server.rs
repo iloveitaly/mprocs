@@ -3,17 +3,16 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::{
+  command::{Command, CommandError, CommandResult, Target, execute},
+  config::hook::Hook,
   console::{
-    app::{ExecuteAction, create_app_task},
-    app_client::client_session,
-    server_message::ClientId,
+    app::create_app_task, app_client::client_session, server_message::ClientId,
   },
   daemon::{lockfile, socket::bind_server_socket},
   kernel::{
     kernel::Kernel,
     kernel_message::{
       KernelCommand, KernelQuery, KernelQueryResponse, TaskContext, TaskInfo,
-      TaskSelector,
     },
     task::TaskState,
     task_key::{TaskKey, TaskSpaceId},
@@ -87,12 +86,10 @@ pub async fn run_server(
       anyhow::bail!("Failed to register console task.");
     }
     if let Some(hook) = on_init {
-      let (done, wait) = tokio::sync::oneshot::channel();
-      app_sender.send(ExecuteAction {
-        action: hook.as_action().clone(),
-        done,
-      });
-      wait.await?;
+      let Hook::Command(command) = hook else {
+        anyhow::bail!("dekit on_init hook is not a command")
+      };
+      execute(&pc, &command).await?;
     }
     anyhow::Ok(())
   }
@@ -222,27 +219,6 @@ fn task_state(state: TaskState) -> RpcState {
   }
 }
 
-fn parse_selector(pattern: &str) -> Result<TaskSelector, RpcError> {
-  match pattern.strip_prefix('#') {
-    Some(tag) => Ok(TaskSelector::Tag(
-      TaskSpaceId::default_space(),
-      tag.to_string(),
-    )),
-    None => {
-      parse_glob(pattern)?;
-      Ok(TaskSelector::Glob(
-        TaskSpaceId::default_space(),
-        pattern.to_string(),
-      ))
-    }
-  }
-}
-
-fn parse_glob(pattern: &str) -> Result<(), RpcError> {
-  TaskPath::check_glob(pattern)
-    .map_err(|err| RpcError::new(codes::BAD_PATH, err.to_string()))
-}
-
 async fn query(
   pc: &TaskContext,
   query: KernelQuery,
@@ -265,20 +241,21 @@ async fn list_tasks(
   }
 }
 
-/// Send a selector command and return how many tasks it matched. The
-/// count comes from the same kernel dispatch that acted, so it reflects
-/// membership at act time.
-async fn act_matching(
+async fn execute_rpc_command(
   pc: &TaskContext,
-  make: impl FnOnce(Option<tokio::sync::oneshot::Sender<usize>>) -> KernelCommand,
-) -> Result<usize, RpcError> {
-  let (tx, rx) = tokio::sync::oneshot::channel();
-  pc.send(make(Some(tx)));
-  rx.await.map_err(RpcError::internal)
-}
-
-fn acted(matched: usize) -> Result<Value, RpcError> {
-  serde_json::to_value(ActResult { matched }).map_err(RpcError::internal)
+  command: Command,
+) -> Result<Value, RpcError> {
+  match execute(pc, &command).await.map_err(|err| match err {
+    CommandError::InvalidTarget(message) => {
+      RpcError::new(codes::BAD_PATH, message)
+    }
+    CommandError::KernelClosed => RpcError::internal(err),
+  })? {
+    CommandResult::Matched(matched) => {
+      serde_json::to_value(ActResult { matched }).map_err(RpcError::internal)
+    }
+    CommandResult::None => Ok(ok_result()),
+  }
 }
 
 fn parse_path(path: &str) -> Result<TaskPath, RpcError> {
@@ -297,7 +274,8 @@ async fn handle_rpc(
 
     RpcRequest::Ls { pattern } => {
       if let Some(pattern) = &pattern {
-        parse_glob(pattern)?;
+        TaskPath::check_glob(pattern)
+          .map_err(|err| RpcError::new(codes::BAD_PATH, err.to_string()))?;
       }
       let tasks = list_tasks(pc, pattern)
         .await?
@@ -315,61 +293,73 @@ async fn handle_rpc(
     }
 
     RpcRequest::Up { pattern } => {
-      let selector = match pattern {
-        Some(pattern) => parse_selector(&pattern)?,
-        None => TaskSelector::Tag(
-          TaskSpaceId::default_space(),
-          crate::config::task::AUTOSTART_TAG.to_string(),
-        ),
+      let target = match pattern {
+        Some(pattern) => Target::Selector(pattern),
+        None => {
+          Target::Selector(format!("+{}", crate::config::task::AUTOSTART_TAG))
+        }
       };
-      let matched =
-        act_matching(pc, |ack| KernelCommand::Start(selector, ack)).await?;
-      acted(matched)
+      execute_rpc_command(pc, Command::Start { target }).await
     }
 
     RpcRequest::Start { pattern } => {
-      let selector = parse_selector(&pattern)?;
-      let matched =
-        act_matching(pc, |ack| KernelCommand::Start(selector, ack)).await?;
-      acted(matched)
+      execute_rpc_command(
+        pc,
+        Command::Start {
+          target: Target::Selector(pattern),
+        },
+      )
+      .await
     }
 
     RpcRequest::Stop { pattern } => {
-      let selector = parse_selector(&pattern)?;
-      let matched =
-        act_matching(pc, |ack| KernelCommand::Stop(selector, ack)).await?;
-      acted(matched)
+      execute_rpc_command(
+        pc,
+        Command::Stop {
+          target: Target::Selector(pattern),
+        },
+      )
+      .await
     }
 
     RpcRequest::Veto { pattern } => {
-      let selector = parse_selector(&pattern)?;
-      let matched =
-        act_matching(pc, |ack| KernelCommand::Veto(selector, ack)).await?;
-      acted(matched)
+      execute_rpc_command(
+        pc,
+        Command::Veto {
+          target: Target::Selector(pattern),
+        },
+      )
+      .await
     }
 
     RpcRequest::Down { pattern } => {
-      let selector = match pattern {
-        Some(pattern) => parse_selector(&pattern)?,
-        None => TaskSelector::All(TaskSpaceId::default_space()),
+      let target = match pattern {
+        Some(pattern) => Target::Selector(pattern),
+        None => Target::All {
+          all: TaskSpaceId::default_space(),
+        },
       };
-      let matched =
-        act_matching(pc, |ack| KernelCommand::Down(selector, ack)).await?;
-      acted(matched)
+      execute_rpc_command(pc, Command::Down { target }).await
     }
 
     RpcRequest::Kill { pattern } => {
-      let selector = parse_selector(&pattern)?;
-      let matched =
-        act_matching(pc, |ack| KernelCommand::Kill(selector, ack)).await?;
-      acted(matched)
+      execute_rpc_command(
+        pc,
+        Command::Kill {
+          target: Target::Selector(pattern),
+        },
+      )
+      .await
     }
 
     RpcRequest::Restart { pattern } => {
-      let selector = parse_selector(&pattern)?;
-      let matched =
-        act_matching(pc, |ack| KernelCommand::Restart(selector, ack)).await?;
-      acted(matched)
+      execute_rpc_command(
+        pc,
+        Command::Restart {
+          target: Target::Selector(pattern),
+        },
+      )
+      .await
     }
 
     RpcRequest::Why { path } => {
@@ -430,10 +420,7 @@ async fn handle_rpc(
       }
     }
 
-    RpcRequest::Shutdown {} => {
-      pc.send(KernelCommand::Quit);
-      Ok(ok_result())
-    }
+    RpcRequest::Shutdown {} => execute_rpc_command(pc, Command::Quit).await,
 
     RpcRequest::Spawn {
       path,

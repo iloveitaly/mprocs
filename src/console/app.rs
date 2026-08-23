@@ -1,8 +1,10 @@
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::{
+  command::{Command, Target, issue},
   config::{
     config::Config,
+    hook::Hook,
     task::{CmdConfig, TaskConfig},
   },
   console::{
@@ -106,11 +108,6 @@ pub struct App {
   screen_size: Size,
   clients: Vec<ClientHandle>,
   bootstrap: bool,
-}
-
-pub(crate) struct ExecuteAction {
-  pub action: Action,
-  pub done: tokio::sync::oneshot::Sender<()>,
 }
 
 impl App {
@@ -508,7 +505,7 @@ impl App {
       }
       Action::Quit => {
         self.state.quitting = true;
-        pc.send(KernelCommand::Quit);
+        self.issue_command(Command::Quit);
         loop_action.render();
       }
       Action::ForceQuit => {
@@ -572,45 +569,69 @@ impl App {
 
       Action::StartTask => {
         if let Some(task) = self.state.get_current_task() {
-          pc.send(KernelCommand::Start(TaskSelector::Id(task.id), None));
+          self.issue_command(Command::Start {
+            target: Target::id(task.id),
+          });
         }
       }
       Action::StopTask => {
         if let Some(task) = self.state.get_current_task() {
-          pc.send(KernelCommand::Stop(TaskSelector::Id(task.id), None));
+          self.issue_command(Command::Stop {
+            target: Target::id(task.id),
+          });
         }
       }
       Action::KillTask => {
         if let Some(task) = self.state.get_current_task() {
-          pc.send(KernelCommand::Kill(TaskSelector::Id(task.id), None));
+          self.issue_command(Command::Kill {
+            target: Target::id(task.id),
+          });
         }
       }
       Action::VetoTask => {
         if let Some(task) = self.state.get_current_task() {
-          pc.send(KernelCommand::Veto(TaskSelector::Id(task.id), None));
+          self.issue_command(Command::Veto {
+            target: Target::id(task.id),
+          });
         }
       }
       Action::RestartTask => {
         if let Some(task) = self.state.get_current_task() {
-          pc.send(KernelCommand::Restart(TaskSelector::Id(task.id), None));
+          self.issue_command(Command::Restart {
+            target: Target::id(task.id),
+          });
         }
       }
       Action::RestartAll => {
-        for task in &self.state.tasks {
-          pc.send(KernelCommand::Restart(TaskSelector::Id(task.id), None));
-        }
+        self.issue_command(Command::Batch {
+          commands: self
+            .state
+            .tasks
+            .iter()
+            .map(|task| Command::Restart {
+              target: Target::id(task.id),
+            })
+            .collect(),
+        });
       }
       Action::ForceRestartTask => {
         if let Some(task) = self.state.get_current_task() {
-          pc.send(KernelCommand::Kill(TaskSelector::Id(task.id), None));
-          pc.send(KernelCommand::Start(TaskSelector::Id(task.id), None));
+          self.issue_command(Command::ForceRestart {
+            target: Target::id(task.id),
+          });
         }
       }
       Action::ForceRestartAll => {
-        for task in &self.state.tasks {
-          pc.send(KernelCommand::Kill(TaskSelector::Id(task.id), None));
-          pc.send(KernelCommand::Start(TaskSelector::Id(task.id), None));
-        }
+        self.issue_command(Command::Batch {
+          commands: self
+            .state
+            .tasks
+            .iter()
+            .map(|task| Command::ForceRestart {
+              target: Target::id(task.id),
+            })
+            .collect(),
+        });
       }
 
       Action::ScrollUp { n, unit } => {
@@ -724,23 +745,26 @@ impl App {
     }
   }
 
+  fn issue_command(&self, command: Command) {
+    if let Err(err) = issue(&self.pc, &command) {
+      log::error!("Command failed: {err}");
+    }
+  }
+
   fn handle_task_command(
     &mut self,
     loop_action: &mut LoopAction,
     command: TaskCmd,
   ) {
     match command {
-      TaskCmd::Start | TaskCmd::Stop | TaskCmd::Kill => (),
+      TaskCmd::Start => (),
+      TaskCmd::Stop => {
+        self.state.quitting = true;
+        loop_action.render();
+      }
+      TaskCmd::Kill => loop_action.force_quit(),
 
       TaskCmd::Msg(msg) => {
-        let msg = match msg.downcast::<ExecuteAction>() {
-          Ok(request) => {
-            self.handle_event(loop_action, &request.action);
-            let _ = request.done.send(());
-            return;
-          }
-          Err(msg) => msg,
-        };
         let msg = match msg.downcast::<Action>() {
           Ok(app_event) => {
             self.handle_event(loop_action, &app_event);
@@ -852,8 +876,12 @@ impl App {
         if known {
           if !state.is_active() && self.state.all_tasks_down() {
             if let Some(hook) = &self.config.on_all_finished {
-              let event = hook.as_action().clone();
-              self.handle_event(loop_action, &event);
+              match hook.clone() {
+                Hook::Command(command) => self.issue_command(command),
+                Hook::LegacyAction(event) => {
+                  self.handle_event(loop_action, &event);
+                }
+              }
             }
           }
           loop_action.render();
@@ -962,8 +990,11 @@ pub async fn server_main(
     bootstrap,
   };
 
-  if bootstrap && let Some(hook) = &app.config.on_init {
-    app.pc.send_self_custom(hook.as_action().clone());
+  if bootstrap
+    && let Some(hook) = &app.config.on_init
+    && let Hook::LegacyAction(action) = hook
+  {
+    app.pc.send_self_custom(action.clone());
   }
 
   app.run().await?;
