@@ -3,7 +3,9 @@ use std::future::pending;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::error::ResultLogger;
-use crate::kernel::kernel_message::{KernelCommand, SharedVt, TaskContext};
+use crate::kernel::kernel_message::{
+  KernelCommand, SharedVt, TaskContext, TaskRegistration,
+};
 use crate::kernel::task::{
   ExitInfo, ReadyMode, RestartMode, TaskCmd, TaskDef, TaskId,
 };
@@ -176,6 +178,15 @@ pub fn spawn_process_task_with_id(
   task_path: Option<TaskPath>,
   config: ProcessTaskConfig,
 ) -> tokio::sync::oneshot::Receiver<bool> {
+  let registration = process_task_registration(task_id, task_path, config);
+  parent.register_task(registration)
+}
+
+pub fn process_task_registration(
+  task_id: TaskId,
+  task_path: Option<TaskPath>,
+  config: ProcessTaskConfig,
+) -> TaskRegistration {
   let ProcessTaskConfig {
     spec,
     stop,
@@ -195,7 +206,7 @@ pub fn spawn_process_task_with_id(
     Some(_) => ReadyMode::Reported,
     None => ReadyMode::Immediate,
   };
-  parent.spawn_async_with_id(
+  TaskRegistration::async_task(
     task_id,
     TaskDef {
       ready,

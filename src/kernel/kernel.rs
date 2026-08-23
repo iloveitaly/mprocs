@@ -1451,15 +1451,18 @@ impl Kernel {
     match msg.command {
       KernelCommand::Quit => return self.graph.begin_quit(),
 
-      KernelCommand::RegisterTask(task_id, def, factory, ack) => {
-        let registered = if self.graph.can_register(msg.from, &def.space) {
-          self.graph.register_task_with_id(task_id, def, factory)
-        } else {
-          false
-        };
-        if let Some(ack) = ack {
-          let _ = ack.send(registered);
-        }
+      KernelCommand::RegisterTask(registration, ack) => {
+        let registered =
+          if self.graph.can_register(msg.from, &registration.def.space) {
+            self.graph.register_task_with_id(
+              registration.task_id,
+              registration.def,
+              registration.factory,
+            )
+          } else {
+            false
+          };
+        let _ = ack.send(registered);
       }
       KernelCommand::RemoveTask(task_id) => {
         if self.graph.can_mutate(msg.from, task_id) {

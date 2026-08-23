@@ -224,10 +224,11 @@ pub async fn run_app(args: Vec<String>) -> anyhow::Result<()> {
       let kernel = Kernel::new();
       let pc = kernel.context();
       let server = config.server.take();
-      let app_task_id = create_app_task(
+      let (app_task_id, _app_ack) = create_app_task(
         crate::config::config::Config::from(config),
         keymap,
         &pc,
+        true,
       );
 
       if let Some(ServerConfig::Tcp(addr)) = server {

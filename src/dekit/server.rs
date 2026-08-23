@@ -4,7 +4,9 @@ use serde_json::Value;
 
 use crate::{
   console::{
-    app::create_app_task, app_client::client_session, server_message::ClientId,
+    app::{ExecuteAction, create_app_task},
+    app_client::client_session,
+    server_message::ClientId,
   },
   daemon::{lockfile, socket::bind_server_socket},
   kernel::{
@@ -22,6 +24,7 @@ use crate::{
     RpcState, RpcTaskInfo, RpcWhy, RpcWhyDep, SpawnResult, TaskListResult,
     codes, ok_result, server_handshake,
   },
+  task::config_tasks::register_config_tasks,
   term::Size,
 };
 
@@ -64,25 +67,60 @@ pub async fn run_server(
   crate::process::unix_processes_waiter::UnixProcessesWaiter::init()?;
   let kernel = Kernel::new();
   let pc = kernel.context();
-
   let socket_path = lock_guard.socket_path().to_path_buf();
-  let app_task_id = create_app_task(config, keymap, &pc);
+  let kernel_handle = tokio::spawn(kernel.run());
+
+  if let Err(err) = register_config_tasks(&config, &pc).await {
+    pc.send(KernelCommand::Quit);
+    let _ = kernel_handle.await;
+    #[cfg(unix)]
+    crate::process::unix_processes_waiter::UnixProcessesWaiter::uninit()?;
+    return Err(err);
+  }
+
+  let on_init = config.on_init.clone();
+  let (app_task_id, app_ack) = create_app_task(config, keymap, &pc, false);
   let app_sender = pc.get_task_sender(app_task_id);
+
+  let bootstrap = async {
+    if !app_ack.await? {
+      anyhow::bail!("Failed to register console task.");
+    }
+    if let Some(hook) = on_init {
+      let (done, wait) = tokio::sync::oneshot::channel();
+      app_sender.send(ExecuteAction {
+        action: hook.as_action().clone(),
+        done,
+      });
+      wait.await?;
+    }
+    anyhow::Ok(())
+  }
+  .await;
+  if let Err(err) = bootstrap {
+    pc.send(KernelCommand::Quit);
+    let _ = kernel_handle.await;
+    #[cfg(unix)]
+    crate::process::unix_processes_waiter::UnixProcessesWaiter::uninit()?;
+    return Err(err);
+  }
+
+  let mut server_socket = match bind_server_socket(&socket_path).await {
+    Ok(server_socket) => {
+      log::info!("Server is listening.");
+      server_socket
+    }
+    Err(err) => {
+      pc.send(KernelCommand::Quit);
+      let _ = kernel_handle.await;
+      #[cfg(unix)]
+      crate::process::unix_processes_waiter::UnixProcessesWaiter::uninit()?;
+      return Err(err.into());
+    }
+  };
 
   tokio::spawn(async move {
     let mut last_client_id = 0;
-
-    let mut server_socket = match bind_server_socket(&socket_path).await {
-      Ok(server_socket) => {
-        log::info!("Server is listening.");
-        server_socket
-      }
-      Err(err) => {
-        log::error!("Failed to bind the server: {:?}", err);
-        pc.send(KernelCommand::Quit);
-        return;
-      }
-    };
     log::debug!("Waiting for clients...");
     loop {
       match server_socket.accept().await {
@@ -104,7 +142,7 @@ pub async fn run_server(
     }
   });
 
-  kernel.run().await;
+  kernel_handle.await?;
 
   // lock_guard is dropped here, removing lock + socket files.
   drop(lock_guard);

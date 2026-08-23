@@ -1,13 +1,9 @@
-use std::collections::{HashMap, VecDeque};
-
-use anyhow::bail;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::{
   config::{
     config::Config,
-    task::{AUTOSTART_TAG, CmdConfig, TaskConfig},
-    task_log::LogMode,
+    task::{CmdConfig, TaskConfig},
   },
   console::{
     action::{Action, CopyMove, ScrollUnit},
@@ -38,23 +34,17 @@ use crate::{
       TaskSelector,
     },
     sub_trie::SubMode,
-    task::{
-      RestartMode, TaskCmd, TaskDef, TaskId, TaskNotification, TaskNotify,
-    },
+    task::{TaskCmd, TaskDef, TaskId, TaskNotification, TaskNotify},
     task_key::{TaskKey, TaskSpaceId},
     task_path::TaskPath,
     task_screen::{
       FramedScreenNotify, ScrollUnit as KernelScrollUnit, TaskScreenCmd,
     },
   },
-  process::process_spec::ProcessSpec,
   protocol::{Bye, CtlMsg, codes},
   task::{
-    logger::{LogResolver, LogSink},
-    process_task::{
-      DuplicateTask, ProcessInput, ProcessTaskConfig,
-      spawn_process_task_with_id,
-    },
+    config_tasks::{register_config_tasks, spawn_config_task},
+    process_task::{DuplicateTask, ProcessInput},
   },
   term::{
     Grid, Size, TermEvent, Winsize,
@@ -115,6 +105,12 @@ pub struct App {
 
   screen_size: Size,
   clients: Vec<ClientHandle>,
+  bootstrap: bool,
+}
+
+pub(crate) struct ExecuteAction {
+  pub action: Action,
+  pub done: tokio::sync::oneshot::Sender<()>,
 }
 
 impl App {
@@ -134,7 +130,9 @@ impl App {
     );
     self.refresh_tasks().await;
 
-    self.start_tasks()?;
+    if self.bootstrap {
+      register_config_tasks(&self.config, &self.pc).await?;
+    }
 
     let mut render_needed = true;
     let mut last_term_size = self.get_layout().term_area().size();
@@ -284,29 +282,6 @@ impl App {
     }
   }
 
-  fn start_tasks(&mut self) -> anyhow::Result<()> {
-    let task_ids: Vec<TaskId> = self
-      .config
-      .tasks
-      .iter()
-      .map(|_| self.pc.alloc_id())
-      .collect();
-    let deps_by_task = resolve_task_deps(&self.config.tasks, &task_ids)?;
-
-    // Deps must be registered first (the kernel refuses a registration
-    // with a missing dep), so register in dependency order.
-    let order = dep_order(&task_ids, &deps_by_task)?;
-    for i in order {
-      let cfg = self.config.tasks[i].clone();
-      let pinned = cfg.autostart();
-      self.spawn_task(cfg, task_ids[i], deps_by_task[i].clone(), pinned);
-    }
-
-    Ok(())
-  }
-
-  /// `pinned` makes "registered and started" one kernel step, so a
-  /// refused registration starts nothing.
   fn spawn_task(
     &self,
     cfg: TaskConfig,
@@ -314,19 +289,8 @@ impl App {
     deps: Vec<TaskId>,
     pinned: bool,
   ) {
-    let merged = self.config.defaults.clone().overlay(cfg);
-    // Legacy mprocs task names are arbitrary strings, so fall back to the
-    // task id when the name is not a valid path. Dekit configs validate
-    // paths at parse time, so the fallback never fires for them.
-    let path = TaskPath::new(&merged.path)
-      .or_else(|_| TaskPath::new(task_id.0.to_string()))
-      .ok();
-    let _ = spawn_process_task_with_id(
-      &self.pc,
-      task_id,
-      path,
-      process_task_config(&merged, task_id, deps, pinned),
-    );
+    let _ =
+      spawn_config_task(&self.config, &self.pc, cfg, task_id, deps, pinned);
   }
 
   fn unique_task_name(&self, base: &str, exclude: Option<TaskId>) -> String {
@@ -769,6 +733,14 @@ impl App {
       TaskCmd::Start | TaskCmd::Stop | TaskCmd::Kill => (),
 
       TaskCmd::Msg(msg) => {
+        let msg = match msg.downcast::<ExecuteAction>() {
+          Ok(request) => {
+            self.handle_event(loop_action, &request.action);
+            let _ = request.done.send(());
+            return;
+          }
+          Err(msg) => msg,
+        };
         let msg = match msg.downcast::<Action>() {
           Ok(app_event) => {
             self.handle_event(loop_action, &app_event);
@@ -928,212 +900,28 @@ fn task_display_name(
     .unwrap_or_else(|| format!("task-{}", id.0))
 }
 
-fn process_task_config(
-  cfg: &TaskConfig,
-  task_id: TaskId,
-  deps: Vec<TaskId>,
-  pinned: bool,
-) -> ProcessTaskConfig {
-  let log = cfg.log.clone().map(|log_cfg| {
-    let name = cfg.path.clone();
-    let id = task_id.0;
-    Box::new(move |pid: u32| {
-      log_cfg.file_path(&name, id, pid).map(|path| LogSink {
-        path,
-        append: log_cfg.mode() == LogMode::Append,
-      })
-    }) as LogResolver
-  });
-  ProcessTaskConfig {
-    spec: ProcessSpec::from(cfg),
-    stop: cfg.stop(),
-    log,
-    restart: if cfg.autorestart() {
-      RestartMode::OnFailure
-    } else {
-      RestartMode::Never
-    },
-    ready_log: cfg.ready_log.clone(),
-    scrollback_len: cfg.scrollback_len(),
-    mouse_scroll_speed: cfg.mouse_scroll_speed(),
-    deps,
-    label: Some(cfg.path.clone()),
-    tags: {
-      let mut tags = cfg.tags.clone();
-      if cfg.autostart() {
-        tags.push(AUTOSTART_TAG.to_string());
-      }
-      tags
-    },
-    pinned,
-  }
-}
-
-fn resolve_task_deps(
-  task_configs: &[TaskConfig],
-  task_ids: &[TaskId],
-) -> anyhow::Result<Vec<Vec<TaskId>>> {
-  if task_configs.len() != task_ids.len() {
-    bail!("Internal error: task and task id counts differ.");
-  }
-
-  let mut name_to_id = HashMap::new();
-  let mut name_to_index = HashMap::new();
-  for (index, (task_config, task_id)) in
-    task_configs.iter().zip(task_ids.iter()).enumerate()
-  {
-    if name_to_id
-      .insert(task_config.path.as_str(), *task_id)
-      .is_some()
-    {
-      bail!("Duplicate task name '{}'.", task_config.path);
-    }
-    name_to_index.insert(task_config.path.as_str(), index);
-  }
-
-  let mut deps_by_task = Vec::with_capacity(task_configs.len());
-  let mut dep_indexes_by_task = Vec::with_capacity(task_configs.len());
-  for task_config in task_configs {
-    let mut deps = Vec::with_capacity(task_config.deps.len());
-    let mut dep_indexes = Vec::with_capacity(task_config.deps.len());
-    for dep_name in &task_config.deps {
-      let Some(dep_id) = name_to_id.get(dep_name.as_str()) else {
-        bail!(
-          "Process '{}' depends on unknown process '{}'.",
-          task_config.path,
-          dep_name
-        );
-      };
-      let Some(dep_index) = name_to_index.get(dep_name.as_str()) else {
-        bail!(
-          "Process '{}' depends on unknown process '{}'.",
-          task_config.path,
-          dep_name
-        );
-      };
-      deps.push(*dep_id);
-      dep_indexes.push(*dep_index);
-    }
-    deps_by_task.push(deps);
-    dep_indexes_by_task.push(dep_indexes);
-  }
-
-  validate_task_dep_cycles(task_configs, &dep_indexes_by_task)?;
-
-  Ok(deps_by_task)
-}
-
-/// Order task indices so every dep comes before its dependent. Deps are
-/// already validated acyclic (`validate_task_dep_cycles`).
-fn dep_order(
-  task_ids: &[TaskId],
-  deps_by_task: &[Vec<TaskId>],
-) -> anyhow::Result<Vec<usize>> {
-  let index_of: HashMap<TaskId, usize> = task_ids
-    .iter()
-    .enumerate()
-    .map(|(i, id)| (*id, i))
-    .collect();
-  let n = task_ids.len();
-  let mut missing_deps = vec![0usize; n];
-  let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
-  for (i, deps) in deps_by_task.iter().enumerate() {
-    missing_deps[i] = deps.len();
-    for dep in deps {
-      dependents[index_of[dep]].push(i);
-    }
-  }
-  let mut queue: VecDeque<usize> =
-    (0..n).filter(|i| missing_deps[*i] == 0).collect();
-  let mut order = Vec::with_capacity(n);
-  while let Some(i) = queue.pop_front() {
-    order.push(i);
-    for &k in &dependents[i] {
-      missing_deps[k] -= 1;
-      if missing_deps[k] == 0 {
-        queue.push_back(k);
-      }
-    }
-  }
-  if order.len() != n {
-    bail!("Dependency cycle among config tasks.");
-  }
-  Ok(order)
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum VisitState {
-  Unvisited,
-  Visiting,
-  Visited,
-}
-
-fn validate_task_dep_cycles(
-  task_configs: &[TaskConfig],
-  deps_by_task: &[Vec<usize>],
-) -> anyhow::Result<()> {
-  let mut states = vec![VisitState::Unvisited; task_configs.len()];
-  let mut stack = Vec::new();
-
-  for index in 0..task_configs.len() {
-    visit_task_deps(
-      index,
-      task_configs,
-      deps_by_task,
-      &mut states,
-      &mut stack,
-    )?;
-  }
-
-  Ok(())
-}
-
-fn visit_task_deps(
-  index: usize,
-  task_configs: &[TaskConfig],
-  deps_by_task: &[Vec<usize>],
-  states: &mut [VisitState],
-  stack: &mut Vec<usize>,
-) -> anyhow::Result<()> {
-  match states[index] {
-    VisitState::Visited => return Ok(()),
-    VisitState::Visiting => {
-      let cycle_start = stack.iter().position(|&i| i == index).unwrap_or(0);
-      let mut cycle = stack[cycle_start..]
-        .iter()
-        .map(|&i| task_configs[i].path.as_str())
-        .collect::<Vec<_>>();
-      cycle.push(task_configs[index].path.as_str());
-      bail!("Process dependency cycle detected: {}.", cycle.join(" -> "));
-    }
-    VisitState::Unvisited => {}
-  }
-
-  states[index] = VisitState::Visiting;
-  stack.push(index);
-  for dep_index in &deps_by_task[index] {
-    visit_task_deps(*dep_index, task_configs, deps_by_task, states, stack)?;
-  }
-  stack.pop();
-  states[index] = VisitState::Visited;
-
-  Ok(())
-}
-
 pub fn create_app_task(
   config: Config,
   keymap: Keymap,
   pc: &TaskContext,
-) -> TaskId {
-  pc.spawn_async(TaskDef::default(), |pc, receiver| async move {
-    log::debug!("Creating app task (id: {})", pc.task_id.0);
-    let r = server_main(config, keymap, receiver, pc.clone()).await;
-    match r {
-      Ok(()) => (),
-      Err(err) => log::error!("App task finished with error: {:?}", err),
-    };
-    pc.send(KernelCommand::Quit);
-  })
+  bootstrap: bool,
+) -> (TaskId, tokio::sync::oneshot::Receiver<bool>) {
+  let task_id = pc.alloc_id();
+  let ack = pc.spawn_async_with_id(
+    task_id,
+    TaskDef::default(),
+    move |pc, receiver| async move {
+      log::debug!("Creating app task (id: {})", pc.task_id.0);
+      let r =
+        server_main(config, keymap, receiver, pc.clone(), bootstrap).await;
+      match r {
+        Ok(()) => (),
+        Err(err) => log::error!("App task finished with error: {:?}", err),
+      };
+      pc.send(KernelCommand::Quit);
+    },
+  );
+  (task_id, ack)
 }
 
 pub async fn server_main(
@@ -1141,6 +929,7 @@ pub async fn server_main(
   keymap: Keymap,
   pr: UnboundedReceiver<TaskCmd>,
   pc: TaskContext,
+  bootstrap: bool,
 ) -> anyhow::Result<()> {
   let state = State {
     current_client_id: None,
@@ -1170,76 +959,14 @@ pub async fn server_main(
 
     screen_size: size,
     clients: Vec::new(),
+    bootstrap,
   };
 
-  if let Some(hook) = &app.config.on_init {
+  if bootstrap && let Some(hook) = &app.config.on_init {
     app.pc.send_self_custom(hook.as_action().clone());
   }
 
   app.run().await?;
 
   Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  fn task_config(name: &str, deps: &[&str]) -> TaskConfig {
-    TaskConfig {
-      path: name.to_string(),
-      cmd: Some(CmdConfig::Shell {
-        shell: "true".to_string(),
-      }),
-      deps: deps.iter().map(|dep| dep.to_string()).collect(),
-      ..TaskConfig::default()
-    }
-  }
-
-  #[test]
-  fn resolve_task_deps_maps_names_to_task_ids() {
-    let task_configs = vec![
-      task_config("db", &[]),
-      task_config("api", &["db"]),
-      task_config("web", &["api", "db"]),
-    ];
-    let task_ids = vec![TaskId(1), TaskId(2), TaskId(3)];
-
-    let deps = resolve_task_deps(&task_configs, &task_ids).unwrap();
-
-    assert_eq!(
-      deps,
-      vec![vec![], vec![TaskId(1)], vec![TaskId(2), TaskId(1)]]
-    );
-  }
-
-  #[test]
-  fn resolve_task_deps_rejects_unknown_dependency() {
-    let task_configs = vec![task_config("api", &["db"])];
-    let task_ids = vec![TaskId(1)];
-
-    let err = resolve_task_deps(&task_configs, &task_ids).unwrap_err();
-
-    assert_eq!(
-      err.to_string(),
-      "Process 'api' depends on unknown process 'db'."
-    );
-  }
-
-  #[test]
-  fn resolve_task_deps_rejects_dependency_cycles() {
-    let task_configs = vec![
-      task_config("api", &["worker"]),
-      task_config("worker", &["db"]),
-      task_config("db", &["api"]),
-    ];
-    let task_ids = vec![TaskId(1), TaskId(2), TaskId(3)];
-
-    let err = resolve_task_deps(&task_configs, &task_ids).unwrap_err();
-
-    assert_eq!(
-      err.to_string(),
-      "Process dependency cycle detected: api -> worker -> db -> api."
-    );
-  }
 }

@@ -19,17 +19,37 @@ pub struct KernelMessage {
   pub command: KernelCommand,
 }
 
+pub struct TaskRegistration {
+  pub task_id: TaskId,
+  pub def: TaskDef,
+  pub factory: Box<dyn FnOnce(TaskContext) -> Box<dyn Task> + Send>,
+}
+
+impl TaskRegistration {
+  pub fn async_task<F, Fut>(task_id: TaskId, def: TaskDef, f: F) -> Self
+  where
+    F: FnOnce(TaskContext, tokio::sync::mpsc::UnboundedReceiver<TaskCmd>) -> Fut
+      + Send
+      + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+  {
+    use super::task::ChannelTask;
+    Self {
+      task_id,
+      def,
+      factory: Box::new(|ctx| {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(f(ctx, rx));
+        Box::new(ChannelTask::new(tx))
+      }),
+    }
+  }
+}
+
 pub enum KernelCommand {
   Quit,
 
-  RegisterTask(
-    TaskId,
-    TaskDef,
-    Box<dyn FnOnce(TaskContext) -> Box<dyn Task> + Send>,
-    /// Answered with whether the task was registered (false: refused,
-    /// e.g. the path is taken).
-    Option<tokio::sync::oneshot::Sender<bool>>,
-  ),
+  RegisterTask(TaskRegistration, tokio::sync::oneshot::Sender<bool>),
   /// Total: removes a task in any state, killing it if it is running.
   RemoveTask(TaskId),
 
@@ -226,7 +246,11 @@ impl TaskContext {
     def: TaskDef,
     factory: Box<dyn FnOnce(TaskContext) -> Box<dyn Task> + Send>,
   ) -> TaskId {
-    self.send(KernelCommand::RegisterTask(task_id, def, factory, None));
+    let _ = self.register_task(TaskRegistration {
+      task_id,
+      def,
+      factory,
+    });
     task_id
   }
 
@@ -255,18 +279,16 @@ impl TaskContext {
       + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
   {
-    use super::task::ChannelTask;
+    let registration = TaskRegistration::async_task(task_id, def, f);
+    self.register_task(registration)
+  }
+
+  pub fn register_task(
+    &self,
+    registration: TaskRegistration,
+  ) -> tokio::sync::oneshot::Receiver<bool> {
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-    self.send(KernelCommand::RegisterTask(
-      task_id,
-      def,
-      Box::new(|ctx| {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(f(ctx, rx));
-        Box::new(ChannelTask::new(tx))
-      }),
-      Some(ack_tx),
-    ));
+    self.send(KernelCommand::RegisterTask(registration, ack_tx));
     ack_rx
   }
 
