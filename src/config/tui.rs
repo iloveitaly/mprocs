@@ -5,17 +5,20 @@ use crate::cfg::{CfgCx, CfgObj};
 const DEFAULT_SIDEBAR_WIDTH: usize = 30;
 const DEFAULT_SIDEBAR_TITLE: &str = "Tasks";
 
+#[derive(Clone)]
 pub struct TuiConfig {
   pub sidebar: SidebarConfig,
   pub tips: TipsConfig,
   pub zoom_tip: bool,
 }
 
+#[derive(Clone)]
 pub struct SidebarConfig {
   pub title: String,
   pub width: usize,
 }
 
+#[derive(Clone)]
 pub struct TipsConfig {
   pub show: bool,
 }

@@ -30,6 +30,7 @@ const ROOT_KEYS_LOCAL: &[&str] = &[
   "tasks",
 ];
 
+#[derive(Clone)]
 pub struct Config {
   pub log: LogConfig,
   pub tasks: Vec<TaskConfig>,

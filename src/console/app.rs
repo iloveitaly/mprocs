@@ -45,7 +45,9 @@ use crate::{
   },
   protocol::{Bye, CtlMsg, codes},
   task::{
-    config_tasks::{register_config_tasks, spawn_config_task},
+    config_tasks::{
+      register_config_tasks, spawn_config_task, unique_task_name,
+    },
     process_task::{DuplicateTask, ProcessInput},
   },
   term::{
@@ -277,34 +279,6 @@ impl App {
         .push(TaskView::new(task.id, name, task.state, vt));
       self.observe_task(task.id, size);
     }
-  }
-
-  fn spawn_task(
-    &self,
-    cfg: TaskConfig,
-    task_id: TaskId,
-    deps: Vec<TaskId>,
-    pinned: bool,
-  ) {
-    let _ =
-      spawn_config_task(&self.config, &self.pc, cfg, task_id, deps, pinned);
-  }
-
-  fn unique_task_name(&self, base: &str, exclude: Option<TaskId>) -> String {
-    let taken = |name: &str| {
-      self
-        .state
-        .tasks
-        .iter()
-        .any(|p| Some(p.id()) != exclude && p.name() == name)
-    };
-    if !taken(base) {
-      return base.to_string();
-    }
-    (2..)
-      .map(|n| format!("{}-{}", base, n))
-      .find(|name| !taken(name))
-      .unwrap()
   }
 
   fn handle_server_message(
@@ -649,19 +623,32 @@ impl App {
       Action::AddTask { cmd, name } => {
         let name = name.clone().unwrap_or_else(|| cmd.clone());
         let task_config = TaskConfig {
-          path: self.unique_task_name(&name, None),
+          path: unique_task_name(
+            &name,
+            None,
+            self.state.tasks.iter().map(|task| (task.id(), task.name())),
+          ),
           cmd: Some(CmdConfig::Shell {
             shell: cmd.to_string(),
           }),
           ..TaskConfig::default()
         };
-        let id = self.pc.alloc_id();
-        self.spawn_task(task_config, id, Vec::new(), true);
+        let _ = spawn_config_task(
+          &self.config,
+          &self.pc,
+          task_config,
+          Vec::new(),
+          true,
+        );
         loop_action.render();
       }
       Action::DuplicateTask => {
         if let Some(task) = self.state.get_current_task() {
-          let name = self.unique_task_name(task.name(), None);
+          let name = unique_task_name(
+            task.name(),
+            None,
+            self.state.tasks.iter().map(|task| (task.id(), task.name())),
+          );
           pc.send_msg(task.id(), DuplicateTask(Some(name)));
           loop_action.render();
         }
@@ -693,7 +680,11 @@ impl App {
       Action::RenameTask { name } => {
         if let Some(task) = self.state.get_current_task() {
           let id = task.id();
-          let name = self.unique_task_name(name, Some(id));
+          let name = unique_task_name(
+            name,
+            Some(id),
+            self.state.tasks.iter().map(|task| (task.id(), task.name())),
+          );
           self.pc.set_task_label(id, Some(name));
           loop_action.render();
         }
@@ -935,21 +926,54 @@ pub fn create_app_task(
   bootstrap: bool,
 ) -> (TaskId, tokio::sync::oneshot::Receiver<bool>) {
   let task_id = pc.alloc_id();
-  let ack = pc.spawn_async_with_id(
+  let ack = pc.register_task(app_task_registration(
     task_id,
     TaskDef::default(),
+    config,
+    keymap,
+    bootstrap,
+  ));
+  (task_id, ack)
+}
+
+pub fn console_task_registration(
+  task_id: TaskId,
+  config: Config,
+  keymap: Keymap,
+) -> crate::kernel::kernel_message::TaskRegistration {
+  app_task_registration(
+    task_id,
+    TaskDef {
+      space: TaskSpaceId::dekit(),
+      path: Some(TaskPath::new("console").expect("valid console path")),
+      ..TaskDef::default()
+    },
+    config,
+    keymap,
+    false,
+  )
+}
+
+fn app_task_registration(
+  task_id: TaskId,
+  def: TaskDef,
+  config: Config,
+  keymap: Keymap,
+  bootstrap: bool,
+) -> crate::kernel::kernel_message::TaskRegistration {
+  crate::kernel::kernel_message::TaskRegistration::async_task(
+    task_id,
+    def,
     move |pc, receiver| async move {
       log::debug!("Creating app task (id: {})", pc.task_id.0);
-      let r =
-        server_main(config, keymap, receiver, pc.clone(), bootstrap).await;
-      match r {
-        Ok(()) => (),
-        Err(err) => log::error!("App task finished with error: {:?}", err),
-      };
+      if let Err(err) =
+        server_main(config, keymap, receiver, pc.clone(), bootstrap).await
+      {
+        log::error!("App task finished with error: {:?}", err);
+      }
       pc.send(KernelCommand::Quit);
     },
-  );
-  (task_id, ack)
+  )
 }
 
 pub async fn server_main(

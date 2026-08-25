@@ -6,7 +6,7 @@ use crate::console::action::{Action, CopyMove, ScrollUnit};
 use crate::console::keymap::Keymap;
 use crate::term::key::{Key, KeyCode, KeyMods, KeySpec};
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct KeymapConfig {
   keymap_tasks: IndexMap<Key, Action>,
   keymap_term: IndexMap<Key, Action>,

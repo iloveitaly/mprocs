@@ -58,11 +58,34 @@ pub fn spawn_config_task(
   config: &Config,
   pc: &TaskContext,
   cfg: TaskConfig,
-  task_id: TaskId,
   deps: Vec<TaskId>,
   pinned: bool,
-) -> tokio::sync::oneshot::Receiver<bool> {
-  pc.register_task(config_task_registration(config, cfg, task_id, deps, pinned))
+) -> (TaskId, tokio::sync::oneshot::Receiver<bool>) {
+  let task_id = pc.alloc_id();
+  let ack = pc.register_task(config_task_registration(
+    config, cfg, task_id, deps, pinned,
+  ));
+  (task_id, ack)
+}
+
+pub fn unique_task_name<'a>(
+  base: &str,
+  exclude: Option<TaskId>,
+  tasks: impl IntoIterator<Item = (TaskId, &'a str)>,
+) -> String {
+  let tasks = tasks.into_iter().collect::<Vec<_>>();
+  let taken = |name: &str| {
+    tasks
+      .iter()
+      .any(|(id, task_name)| Some(*id) != exclude && *task_name == name)
+  };
+  if !taken(base) {
+    return base.to_string();
+  }
+  (2..)
+    .map(|n| format!("{}-{}", base, n))
+    .find(|name| !taken(name))
+    .unwrap()
 }
 
 fn config_task_registration(
@@ -328,6 +351,19 @@ mod tests {
     assert_eq!(
       err.to_string(),
       "Process dependency cycle detected: api -> worker -> db -> api."
+    );
+  }
+
+  #[test]
+  fn uniquifies_runtime_task_names() {
+    let tasks = [(TaskId(1), "web"), (TaskId(2), "web-2")];
+    assert_eq!(
+      unique_task_name("web", None, tasks.iter().copied()),
+      "web-3"
+    );
+    assert_eq!(
+      unique_task_name("web", Some(TaskId(1)), tasks.iter().copied()),
+      "web"
     );
   }
 

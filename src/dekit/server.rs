@@ -6,7 +6,8 @@ use crate::{
   command::{Command, CommandError, CommandResult, Target, execute},
   config::hook::Hook,
   console::{
-    app::create_app_task, app_client::client_session, server_message::ClientId,
+    app::console_task_registration, app_client::client_session,
+    server_message::ClientId,
   },
   daemon::{lockfile, socket::bind_server_socket},
   kernel::{
@@ -64,9 +65,19 @@ pub async fn run_server(
 
   #[cfg(unix)]
   crate::process::unix_processes_waiter::UnixProcessesWaiter::init()?;
-  let kernel = Kernel::new();
+  let mut kernel = Kernel::new();
   let pc = kernel.context();
   let socket_path = lock_guard.socket_path().to_path_buf();
+  let on_init = config.on_init.clone();
+  let app_task_id = pc.alloc_id();
+  let app_registration =
+    console_task_registration(app_task_id, config.clone(), keymap);
+  if !kernel.register_task_registration(app_registration) {
+    #[cfg(unix)]
+    crate::process::unix_processes_waiter::UnixProcessesWaiter::uninit()?;
+    anyhow::bail!("Failed to register console task.")
+  }
+  let app_sender = pc.get_task_sender(app_task_id);
   let kernel_handle = tokio::spawn(kernel.run());
 
   if let Err(err) = register_config_tasks(&config, &pc).await {
@@ -77,14 +88,7 @@ pub async fn run_server(
     return Err(err);
   }
 
-  let on_init = config.on_init.clone();
-  let (app_task_id, app_ack) = create_app_task(config, keymap, &pc, false);
-  let app_sender = pc.get_task_sender(app_task_id);
-
   let bootstrap = async {
-    if !app_ack.await? {
-      anyhow::bail!("Failed to register console task.");
-    }
     if let Some(hook) = on_init {
       let Hook::Command(command) = hook else {
         anyhow::bail!("dekit on_init hook is not a command")

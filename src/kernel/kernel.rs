@@ -11,7 +11,7 @@ use crate::kernel::kernel_message::TaskContext;
 use super::{
   kernel_message::{
     DepExplain, KernelCommand, KernelMessage, KernelQuery, KernelQueryResponse,
-    TaskExplain, TaskInfo, TaskSelector,
+    TaskExplain, TaskInfo, TaskRegistration, TaskSelector,
   },
   namespace::Namespace,
   sub_trie::SubMode,
@@ -1416,6 +1416,18 @@ impl Kernel {
       .graph
       .register_task_with_id(task_id, def, Box::new(factory));
     task_id
+  }
+
+  /// Installs a task before the kernel starts processing untrusted messages.
+  pub fn register_task_registration(
+    &mut self,
+    registration: TaskRegistration,
+  ) -> bool {
+    self.graph.register_task_with_id(
+      registration.task_id,
+      registration.def,
+      registration.factory,
+    )
   }
 
   pub async fn run(mut self) {
