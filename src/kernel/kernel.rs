@@ -1203,7 +1203,7 @@ impl Graph {
       .and_then(|task_id| self.tasks.get(&task_id))
       .and_then(|handle| handle.vt.as_ref())
       .and_then(|vt| vt.read().ok())
-      .map(|parser| crate::term::ansi::render_screen_ansi(parser.screen()))
+      .map(|screen| crate::term::ansi::render_screen_ansi(&screen))
   }
 
   fn explain_at(&self, key: &TaskKey) -> Option<TaskExplain> {

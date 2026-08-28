@@ -256,32 +256,23 @@ impl Grid {
     self.rows.len() - self.size.height as usize
   }
 
-  pub fn visible_rows(&self) -> impl Iterator<Item = &Row> {
-    self
-      .rows
-      .iter()
-      .skip(self.row0().saturating_sub(self.scrollback_offset))
-  }
-
-  pub fn drawing_rows(&self) -> impl Iterator<Item = &Row> {
-    self.rows.iter().skip(self.row0())
-  }
-
-  pub fn drawing_rows_mut(&mut self) -> impl Iterator<Item = &mut Row> {
+  fn drawing_rows_mut(&mut self) -> impl Iterator<Item = &mut Row> {
     let row0 = self.row0();
     self.rows.iter_mut().skip(row0)
   }
 
   pub fn visible_row(&self, row: u16) -> Option<&Row> {
-    self.visible_rows().nth(usize::from(row))
+    let first = self.row0().saturating_sub(self.scrollback_offset);
+    self.rows.get(first + usize::from(row))
   }
 
   pub fn drawing_row(&self, row: u16) -> Option<&Row> {
-    self.drawing_rows().nth(usize::from(row))
+    self.rows.get(self.row0() + usize::from(row))
   }
 
   pub fn drawing_row_mut(&mut self, row: u16) -> Option<&mut Row> {
-    self.drawing_rows_mut().nth(usize::from(row))
+    let row0 = self.row0();
+    self.rows.get_mut(row0 + usize::from(row))
   }
 
   pub fn current_row_mut(&mut self) -> &mut Row {
@@ -539,6 +530,48 @@ impl Grid {
   pub fn col_set(&mut self, i: u16) {
     self.pos.col = i;
     self.col_clamp();
+  }
+
+  /// Writes a run of single-width ASCII chars into one row starting at
+  /// `pos`, without moving the cursor. The run must fit within the row.
+  pub fn write_ascii_row(&mut self, pos: Pos, bytes: &[u8], attrs: Attrs) {
+    if bytes.is_empty() {
+      return;
+    }
+    // Overwriting the right half of a wide char clears its left half.
+    if self.is_wide_continuation(pos) {
+      if let Some(prev) = self.drawing_cell_mut(Pos {
+        row: pos.row,
+        col: pos.col - 1,
+      }) {
+        prev.clear(attrs);
+      }
+    }
+    // Overwriting the left half of a wide char at the end of the run
+    // clears the continuation cell it leaves behind.
+    let last = Pos {
+      row: pos.row,
+      col: pos.col + bytes.len() as u16 - 1,
+    };
+    if self
+      .drawing_cell(last)
+      .is_some_and(super::cell::Cell::is_wide)
+    {
+      if let Some(next) = self.drawing_cell_mut(Pos {
+        row: last.row,
+        col: last.col + 1,
+      }) {
+        next.set(' ', attrs);
+      }
+    }
+    self.used_rows = self.used_rows.max(pos.row + 1);
+    if let Some(row) = self.drawing_row_mut(pos.row) {
+      for (i, b) in bytes.iter().enumerate() {
+        if let Some(cell) = row.get_mut(pos.col + i as u16) {
+          cell.set(*b as char, attrs);
+        }
+      }
+    }
   }
 
   pub fn col_wrap(&mut self, width: u16, wrap: bool) {

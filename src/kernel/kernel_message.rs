@@ -7,7 +7,7 @@ use std::{
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::term::Parser;
+use crate::term::Screen;
 
 use super::sub_trie::SubMode;
 use super::task::{ExitInfo, Task, TaskCmd, TaskDef, TaskId, TaskState};
@@ -162,11 +162,11 @@ pub struct DepExplain {
 }
 
 #[derive(Clone)]
-pub struct SharedVt(Arc<RwLock<Parser>>);
+pub struct SharedVt(Arc<RwLock<Screen>>);
 
 impl SharedVt {
-  pub fn new(parser: Parser) -> Self {
-    SharedVt(Arc::new(RwLock::new(parser)))
+  pub fn new(screen: Screen) -> Self {
+    SharedVt(Arc::new(RwLock::new(screen)))
   }
 }
 
@@ -177,7 +177,7 @@ impl Debug for SharedVt {
 }
 
 impl Deref for SharedVt {
-  type Target = Arc<RwLock<Parser>>;
+  type Target = Arc<RwLock<Screen>>;
 
   fn deref(&self) -> &Self::Target {
     &self.0

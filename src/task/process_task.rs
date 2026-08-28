@@ -15,13 +15,15 @@ use crate::process::NativeProcess;
 use crate::process::process::Process as _;
 use crate::process::process_spec::ProcessSpec;
 use crate::task::logger::{LogResolver, spawn_logger};
-use crate::term::encode::{KeyCodeEncodeModes, encode_key};
 use crate::term::key::Key;
-use crate::term::{Parser, Winsize};
+use crate::term::vt::emit::{self, KeyEncodeModes};
+use crate::term::{Screen, Size, Winsize};
 
 struct ProcExited(ExitInfo);
 
 pub struct ProcessInput(pub Key);
+
+pub struct ProcessPaste(pub String);
 
 pub struct DuplicateTask(pub Option<String>);
 
@@ -200,7 +202,13 @@ pub fn process_task_registration(
     tags,
     pinned,
   } = config;
-  let vt = SharedVt::new(Parser::new(24, 80, scrollback_len));
+  let vt = SharedVt::new(Screen::new(
+    Size {
+      height: 24,
+      width: 80,
+    },
+    scrollback_len,
+  ));
   let task_vt = vt.clone();
   let ready = match ready_log {
     Some(_) => ReadyMode::Reported,
@@ -258,6 +266,7 @@ async fn process_main(
   // The log path is resolved per spawn (it may contain the pid).
   let mut current_log: Option<(std::path::PathBuf, u64)> = None;
   let mut read_buf = [0u8; 8 * 1024];
+  let mut key_buf: Vec<u8> = Vec::new();
   let mut stdout_eof = false;
   let mut exit_info: Option<ExitInfo> = None;
   let mut ready_line_buf: Vec<u8> = Vec::new();
@@ -343,7 +352,23 @@ async fn process_main(
           let msg = match msg.downcast::<ProcessInput>() {
             Ok(input) => {
               if let Some(p) = process.as_mut() {
-                send_key(p, task_screen.vt(), input.0).await;
+                send_key(p, task_screen.vt(), input.0, &mut key_buf).await;
+              }
+              continue;
+            }
+            Err(msg) => msg,
+          };
+          let msg = match msg.downcast::<ProcessPaste>() {
+            Ok(paste) => {
+              if let Some(p) = process.as_mut() {
+                let bracketed = task_screen
+                  .vt()
+                  .read()
+                  .map(|screen| screen.bracketed_paste())
+                  .unwrap_or(false);
+                key_buf.clear();
+                emit::paste(&mut key_buf, &paste.0, bracketed);
+                p.write_all(&key_buf).await.log_ignore();
               }
               continue;
             }
@@ -459,8 +484,8 @@ fn start_instance(
   vt: &SharedVt,
 ) -> Option<NativeProcess> {
   let size = match vt.read() {
-    Ok(parser) => {
-      let s = parser.screen().size();
+    Ok(screen) => {
+      let s = screen.size();
       Winsize {
         x: s.width,
         y: s.height,
@@ -475,9 +500,9 @@ fn start_instance(
       y_px: 0,
     },
   };
-  if let Ok(mut parser) = vt.write() {
-    parser.reset();
-    parser.set_size(size.y, size.x);
+  if let Ok(mut screen) = vt.write() {
+    screen.reset();
+    screen.set_size(size.y, size.x);
   }
   match spawn_native(ctx, spec, size) {
     Ok(process) => {
@@ -501,12 +526,12 @@ async fn apply_effects(
     match effect {
       TaskScreenEffect::Write(s) => {
         if let Some(p) = process.as_mut() {
-          p.write_all(s.as_bytes()).await.log_ignore();
+          p.write_all(&s).await.log_ignore();
         }
       }
       TaskScreenEffect::Resize(size) => {
-        if let Ok(mut parser) = vt.write() {
-          parser.set_size(size.y, size.x);
+        if let Ok(mut screen) = vt.write() {
+          screen.set_size(size.y, size.x);
         }
         if let Some(p) = process.as_mut() {
           p.resize(size).log_ignore();
@@ -516,19 +541,25 @@ async fn apply_effects(
   }
 }
 
-async fn send_key(process: &mut NativeProcess, vt: &SharedVt, key: Key) {
+async fn send_key(
+  process: &mut NativeProcess,
+  vt: &SharedVt,
+  key: Key,
+  buf: &mut Vec<u8>,
+) {
   let application_cursor_keys = vt
     .read()
-    .map(|parser| parser.screen().application_cursor())
+    .map(|screen| screen.application_cursor())
     .unwrap_or(false);
-  let modes = KeyCodeEncodeModes {
+  let modes = KeyEncodeModes {
     enable_csi_u_key_encoding: true,
     application_cursor_keys,
     newline_mode: false,
   };
-  match encode_key(&key, modes) {
-    Ok(encoded) => process.write_all(encoded.as_bytes()).await.log_ignore(),
-    Err(_) => log::warn!("Failed to encode key: {}", key.spec()),
+  buf.clear();
+  emit::key(buf, &key, modes);
+  if !buf.is_empty() {
+    process.write_all(buf).await.log_ignore();
   }
 }
 
@@ -548,8 +579,9 @@ async fn stop_process(
       process.send_signal(sig.to_libc(), *group).log_ignore();
     }
     StopSignal::SendKeys(keys) => {
+      let mut buf = Vec::new();
       for key in keys {
-        send_key(process, vt, key.clone()).await;
+        send_key(process, vt, key.clone(), &mut buf).await;
       }
     }
     StopSignal::Cmd(shell) => run_stop_cmd(spec, shell.clone()),
@@ -577,8 +609,9 @@ async fn stop_process(
       _ => log::debug!("{sig:?} has no Windows equivalent; ignoring"),
     },
     StopSignal::SendKeys(keys) => {
+      let mut buf = Vec::new();
       for key in keys {
-        send_key(process, vt, key.clone()).await;
+        send_key(process, vt, key.clone(), &mut buf).await;
       }
     }
     StopSignal::Cmd(shell) => run_stop_cmd(spec, shell.clone()),

@@ -1,5 +1,3 @@
-use std::fmt::Write;
-
 use unicode_width::UnicodeWidthStr;
 
 use super::{
@@ -7,6 +5,7 @@ use super::{
   attrs::Attrs,
   common::{CursorStyle, Size},
   grid::{Grid, Pos},
+  vt::emit,
 };
 
 pub struct ScreenDiffer {
@@ -38,13 +37,10 @@ impl ScreenDiffer {
     }
   }
 
-  pub fn diff<V: BufferView, W: Write>(
-    &mut self,
-    w: &mut W,
-    view: &V,
-  ) -> std::fmt::Result {
+  pub fn diff<V: BufferView>(&mut self, out: &mut Vec<u8>, view: &V) {
     let prev = &mut self.cells;
     let brush = &mut self.brush;
+    let default_cell = Cell::default();
 
     let size = view.size();
     let mut full_rerender = false;
@@ -61,8 +57,7 @@ impl ScreenDiffer {
         let offset = (size.width * y + x) as usize;
         let cell = view
           .get_cell(Pos { col: x, row: y })
-          .cloned()
-          .unwrap_or_default();
+          .unwrap_or(&default_cell);
 
         // Check if this cell is a continuation of a wide character.
         // Skip output for it but keep the diff state in sync.
@@ -71,71 +66,20 @@ impl ScreenDiffer {
             .get_cell(Pos { col: x - 1, row: y })
             .is_some_and(Cell::is_wide)
         {
-          prev[offset] = cell;
+          if prev[offset] != *cell {
+            prev[offset] = cell.clone();
+          }
           continue;
         }
 
-        let mut sep = {
-          let mut first = true;
-          move |w: &mut W| {
-            if first {
-              first = false;
-              Ok(())
-            } else {
-              write!(w, ";")
-            }
-          }
-        };
-
-        if full_rerender || cell != prev[offset] {
+        if full_rerender || *cell != prev[offset] {
           let attrs = *cell.attrs();
-
-          if *brush != attrs {
-            write!(w, "\x1b[")?;
-            if brush.fgcolor != attrs.fgcolor {
-              sep(w)?;
-              match attrs.fgcolor {
-                super::Color::Default => write!(w, "39")?,
-                super::Color::Idx(idx) => write!(w, "38;5;{}", idx)?,
-                super::Color::Rgb(r, g, b) => write!(w, "38;2;{r};{g};{b}")?,
-              }
-            }
-            if brush.bgcolor != attrs.bgcolor {
-              sep(w)?;
-              match attrs.bgcolor {
-                super::Color::Default => write!(w, "49")?,
-                super::Color::Idx(idx) => write!(w, "48;5;{}", idx)?,
-                super::Color::Rgb(r, g, b) => write!(w, "48;2;{r};{g};{b}")?,
-              }
-            }
-            if brush.bold() != attrs.bold() {
-              sep(w)?;
-              let value = if attrs.bold() { 1 } else { 22 };
-              write!(w, "{value}")?;
-            }
-            if brush.italic() != attrs.italic() {
-              sep(w)?;
-              let value = if attrs.italic() { 3 } else { 23 };
-              write!(w, "{value}")?;
-            }
-            if brush.underline() != attrs.underline() {
-              sep(w)?;
-              let value = if attrs.underline() { 4 } else { 24 };
-              write!(w, "{value}")?;
-            }
-            if brush.inverse() != attrs.inverse() {
-              sep(w)?;
-              let value = if attrs.inverse() { 7 } else { 27 };
-              write!(w, "{value}")?;
-            }
-            write!(w, "m")?;
-
-            *brush = attrs;
-          }
+          emit::sgr(out, *brush, attrs);
+          *brush = attrs;
 
           let pos = Pos { row: y, col: x };
           if self.pos != pos {
-            write!(w, "\x1b[{};{}H", pos.row + 1, pos.col + 1)?;
+            emit::cup(out, pos.row, pos.col);
             self.pos = pos;
           }
 
@@ -144,43 +88,32 @@ impl ScreenDiffer {
           } else {
             " "
           };
-          write!(w, "{}", c)?;
+          out.extend_from_slice(c.as_bytes());
           self.pos.col = (size.width - 1).min(self.pos.col + c.width() as u16);
-          prev[offset] = cell;
+          prev[offset] = cell.clone();
         }
       }
     }
 
     if self.cursor_pos.is_some() != view.get_cursor_pos().is_some() {
       if view.get_cursor_pos().is_some() {
-        write!(w, "\x1b[?25h")?;
+        emit::dec_set(out, emit::DecMode::ShowCursor);
       } else {
-        write!(w, "\x1b[?25l")?;
+        emit::dec_reset(out, emit::DecMode::ShowCursor);
       }
     }
     if let Some(pos) = view.get_cursor_pos() {
       if self.pos != pos {
-        write!(w, "\x1b[{};{}H", pos.row + 1, pos.col + 1)?;
+        emit::cup(out, pos.row, pos.col);
       }
       self.pos = pos;
     }
     self.cursor_pos = view.get_cursor_pos();
 
     if self.cursor_style != view.get_cursor_style() {
-      let cmd = match view.get_cursor_style() {
-        CursorStyle::Default => 0,
-        CursorStyle::BlinkingBlock => 1,
-        CursorStyle::SteadyBlock => 2,
-        CursorStyle::BlinkingUnderline => 3,
-        CursorStyle::SteadyUnderline => 4,
-        CursorStyle::BlinkingBar => 5,
-        CursorStyle::SteadyBar => 6,
-      };
-      write!(w, "\x1b[{} q", cmd)?;
+      emit::cursor_style(out, view.get_cursor_style());
       self.cursor_style = view.get_cursor_style();
     }
-
-    Ok(())
   }
 }
 
@@ -240,10 +173,10 @@ mod tests {
     };
 
     let mut differ = ScreenDiffer::new();
-    let mut out = String::new();
+    let mut out = Vec::new();
 
-    differ.diff(&mut out, &vec![vec![]]).unwrap();
-    assert_eq!("\x1b[?25l", out); // Hide cursor
+    differ.diff(&mut out, &vec![vec![]]);
+    assert_eq!(out, b"\x1b[?25l"); // Hide cursor
 
     let screen = vec![vec![
       Cell::new("1"),
@@ -253,8 +186,8 @@ mod tests {
       Cell::new("5"),
     ]];
     out.clear();
-    differ.diff(&mut out, &screen).unwrap();
-    assert_eq!("\x1b[1;1H12\x1b[38;5;4m34\x1b[39m5", out);
+    differ.diff(&mut out, &screen);
+    assert_eq!(out, b"\x1b[1;1H12\x1b[38;5;4m34\x1b[39m5");
 
     let screen = vec![vec![
       Cell::new("1"),
@@ -264,14 +197,14 @@ mod tests {
       Cell::new("5"),
     ]];
     out.clear();
-    differ.diff(&mut out, &screen).unwrap();
-    assert_eq!("\x1b[1;2H_3", out);
+    differ.diff(&mut out, &screen);
+    assert_eq!(out, b"\x1b[1;2H_3");
   }
 
   #[test]
   fn wide_char_continuation_not_overwritten() {
     let mut differ = ScreenDiffer::new();
-    let mut out = String::new();
+    let mut out = Vec::new();
 
     // "A测B": 测 is a wide character occupying two columns. The empty cell
     // after it is the continuation (right half) and must not be drawn,
@@ -282,13 +215,13 @@ mod tests {
       Cell::default(),
       Cell::new("B"),
     ]];
-    differ.diff(&mut out, &screen).unwrap();
-    assert_eq!("\x1b[1;1HA测B\x1b[?25l", out);
+    differ.diff(&mut out, &screen);
+    assert_eq!(out, "\x1b[1;1HA测B\x1b[?25l".as_bytes());
 
     // A redraw of the identical screen must not emit anything (the diff
     // state stays in sync even though the continuation cell was skipped).
     out.clear();
-    differ.diff(&mut out, &screen).unwrap();
-    assert_eq!("", out);
+    differ.diff(&mut out, &screen);
+    assert_eq!(out, b"");
   }
 }

@@ -1,7 +1,6 @@
 use std::process::Stdio;
 
 use anyhow::Result;
-use base64::Engine;
 use which::which;
 
 #[allow(dead_code)]
@@ -73,11 +72,9 @@ fn copy_impl(s: &str, provider: &Provider) -> Result<()> {
     Provider::OSC52 => {
       let mut stdout = std::io::stdout().lock();
       use std::io::Write;
-      write!(
-        &mut stdout,
-        "\x1b]52;;{}\x07",
-        base64::engine::general_purpose::STANDARD.encode(s)
-      )?;
+      let mut seq = Vec::new();
+      crate::term::vt::emit::osc52_copy(&mut seq, s);
+      stdout.write_all(&seq)?;
     }
 
     Provider::Exec(prog, args) => {

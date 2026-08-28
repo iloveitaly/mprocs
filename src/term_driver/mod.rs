@@ -3,18 +3,18 @@ use std::io::Write;
 use std::pin::Pin;
 use std::time::Duration;
 
-mod input_parser;
+mod input;
 pub(crate) mod internal;
 #[cfg(windows)]
 mod windows;
 
 use crate::{
   error::ResultLogger,
-  term::{Size, TermEvent},
+  term::{Size, TermEvent, vt::emit},
 };
 
 use self::{
-  input_parser::InputParser,
+  input::EventDecoder,
   internal::{InternalTermEvent, KeyboardMode},
 };
 
@@ -70,31 +70,25 @@ impl TermDriver {
       &termios,
     )?;
 
-    // Save Cursor (DECSC)
-    stdout.write_all(b"\x1b7")?;
-    // Enter alternate screen.
-    stdout.write_all(b"\x1B[?1049h")?;
-    // Clear all.
-    stdout.write_all(b"\x1B[2J")?;
-    // Mouse
-    {
-      // Normal tracking: Send mouse X & Y on button press and release
-      stdout.write_all(b"\x1B[?1000h")?;
-      // Button-event tracking: Report button motion events (dragging)
-      stdout.write_all(b"\x1B[?1002h")?;
-      // Any-event tracking: Report all motion events
-      stdout.write_all(b"\x1B[?1003h")?;
-      // RXVT mouse mode: Allows mouse coordinates of >223
-      stdout.write_all(b"\x1B[?1015h")?;
-      // SGR mouse mode: Allows mouse coordinates of >223, preferred over RXVT mode
-      stdout.write_all(b"\x1B[?1006h")?;
-    }
+    let mut seq: Vec<u8> = Vec::new();
+    seq.extend_from_slice(emit::SAVE_CURSOR.as_bytes());
+    emit::dec_set(&mut seq, emit::DecMode::AltScreen);
+    seq.extend_from_slice(emit::CLEAR_ALL.as_bytes());
+    // Mouse: press/release, drag motion, all motion, and the rxvt/SGR
+    // encodings that allow coordinates over 223 (SGR preferred).
+    emit::dec_set(&mut seq, emit::DecMode::MousePressRelease);
+    emit::dec_set(&mut seq, emit::DecMode::MouseButtonMotion);
+    emit::dec_set(&mut seq, emit::DecMode::MouseAnyMotion);
+    emit::dec_set(&mut seq, emit::DecMode::MouseRxvt);
+    emit::dec_set(&mut seq, emit::DecMode::MouseSgr);
+    emit::dec_set(&mut seq, emit::DecMode::BracketedPaste);
 
     // Query kitty keyboard protocol. Skipped on Windows (issue #215).
     #[cfg(unix)]
-    stdout.write_all(b"\x1B[?u")?;
+    seq.extend_from_slice(emit::KITTY_QUERY.as_bytes());
     // Query device.
-    stdout.write_all(b"\x1B[c")?;
+    seq.extend_from_slice(emit::DA1_QUERY.as_bytes());
+    stdout.write_all(&seq)?;
 
     #[cfg(unix)]
     let sigwinch = tokio::signal::unix::signal(
@@ -119,7 +113,7 @@ impl TermDriver {
       let stdin_raw = stdin_fd.as_raw_fd();
 
       let stdin_thread = std::thread::spawn(move || {
-        let mut input_parser = InputParser::new();
+        let mut decoder = EventDecoder::new();
         let mut read_buf = [0u8; 1024];
 
         loop {
@@ -168,7 +162,10 @@ impl TermDriver {
               break;
             }
 
-            input_parser.parse_input(&read_buf[..n], true, false, |event| {
+            decoder.feed(&read_buf[..n], |event| {
+              let _ = sender.send(Ok(event));
+            });
+            decoder.flush(|event| {
               let _ = sender.send(Ok(event));
             });
           }
@@ -191,7 +188,7 @@ impl TermDriver {
               return;
             }
           };
-          let mut input_parser = InputParser::new();
+          let mut decoder = EventDecoder::new();
           let mut buf =
             [::windows::Win32::System::Console::INPUT_RECORD::default(); 128];
           loop {
@@ -207,7 +204,7 @@ impl TermDriver {
             };
 
             windows::decode_input_records(
-              &mut input_parser,
+              &mut decoder,
               &buf[..count as usize],
               &mut |event| {
                 let _ = sender.send(Ok(event));
@@ -256,6 +253,9 @@ impl TermDriver {
       InternalTermEvent::Mouse(mouse_event) => {
         return Ok(Some(TermEvent::Mouse(mouse_event)));
       }
+      InternalTermEvent::Paste(text) => {
+        return Ok(Some(TermEvent::Paste(text)));
+      }
       InternalTermEvent::Resize(cols, rows) => {
         return Ok(Some(TermEvent::Resize(cols, rows)));
       }
@@ -276,7 +276,9 @@ impl TermDriver {
         // 0b1000 (8) - Report all keys as escape codes
         // 0b10000 (16) - Report associated text
         // 0b1111 = 15
-        self.stdout.write_all(b"\x1b[>15u")?;
+        let mut seq = Vec::new();
+        emit::kitty_push(&mut seq, 15);
+        self.stdout.write_all(&seq)?;
       }
     };
     Ok(None)
@@ -284,16 +286,18 @@ impl TermDriver {
 
   fn activate_keyboard_fallback(&mut self) -> std::io::Result<()> {
     if matches!(self.keyboard, KeyboardMode::Unknown) {
+      let mut seq = Vec::new();
       #[cfg(unix)]
       {
         self.keyboard = KeyboardMode::ModifyOtherKeys;
-        self.stdout.write_all(b"\x1b[>4;2m")?;
+        emit::modify_other_keys(&mut seq, 2);
       }
       #[cfg(windows)]
       {
         self.keyboard = KeyboardMode::Win32;
-        self.stdout.write_all(b"\x1b[?9001h")?;
+        emit::dec_set(&mut seq, emit::DecMode::Win32Input);
       }
+      self.stdout.write_all(&seq)?;
     }
     Ok(())
   }
@@ -410,35 +414,29 @@ impl TermDriver {
 
 impl Drop for TermDriver {
   fn drop(&mut self) {
+    let mut seq: Vec<u8> = Vec::new();
     match self.keyboard {
       KeyboardMode::Unknown => (),
-      KeyboardMode::ModifyOtherKeys => {
-        self.stdout.write_all(b"\x1b[>4;0m").log_ignore();
-      }
-      KeyboardMode::Kitty => {
-        self.stdout.write_all(b"\x1b[<1u").log_ignore();
-      }
+      KeyboardMode::ModifyOtherKeys => emit::modify_other_keys(&mut seq, 0),
+      KeyboardMode::Kitty => seq.extend_from_slice(emit::KITTY_POP.as_bytes()),
       KeyboardMode::Win32 => {
-        self.stdout.write_all(b"\x1b[?9001l").log_ignore();
+        emit::dec_reset(&mut seq, emit::DecMode::Win32Input)
       }
     }
 
-    // Mouse
-    {
-      self.stdout.write_all(b"\x1B[?1006l").log_ignore();
-      self.stdout.write_all(b"\x1B[?1015l").log_ignore();
-      self.stdout.write_all(b"\x1B[?1003l").log_ignore();
-      self.stdout.write_all(b"\x1B[?1002l").log_ignore();
-      self.stdout.write_all(b"\x1B[?1000l").log_ignore();
-    }
-    // Leave alternate screen.
-    self.stdout.write_all(b"\x1B[?1049l").log_ignore();
+    emit::dec_reset(&mut seq, emit::DecMode::BracketedPaste);
+    emit::dec_reset(&mut seq, emit::DecMode::MouseSgr);
+    emit::dec_reset(&mut seq, emit::DecMode::MouseRxvt);
+    emit::dec_reset(&mut seq, emit::DecMode::MouseAnyMotion);
+    emit::dec_reset(&mut seq, emit::DecMode::MouseButtonMotion);
+    emit::dec_reset(&mut seq, emit::DecMode::MousePressRelease);
+    emit::dec_reset(&mut seq, emit::DecMode::AltScreen);
 
     // Save/Restore does not work on tmux. So we just show cursor.
-    self.stdout.write_all(b"\x1b[?25h").log_ignore();
-    // Restore Cursor (DECRC)
-    self.stdout.write_all(b"\x1b8").log_ignore();
+    emit::dec_set(&mut seq, emit::DecMode::ShowCursor);
+    seq.extend_from_slice(emit::RESTORE_CURSOR.as_bytes());
 
+    self.stdout.write_all(&seq).log_ignore();
     self.stdout.flush().log_ignore();
 
     #[cfg(unix)]

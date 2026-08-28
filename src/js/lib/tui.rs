@@ -19,7 +19,7 @@ struct TuiState {
   term_driver: TermDriver,
   differ: ScreenDiffer,
   grid: Rc<RefCell<Grid>>,
-  draw_buf: String,
+  draw_buf: Vec<u8>,
 }
 
 unsafe impl<'js> rquickjs::JsLifetime<'js> for TuiState {
@@ -95,7 +95,7 @@ fn open_fn(ctx: Ctx<'_>) -> rquickjs::Result<()> {
     term_driver,
     differ: ScreenDiffer::new(),
     grid: Rc::new(RefCell::new(Grid::new(size, 0))),
-    draw_buf: String::new(),
+    draw_buf: Vec::new(),
   });
   Ok(())
 }
@@ -255,13 +255,11 @@ fn draw_fn<'js>(ctx: Ctx<'js>, cb: Function<'js>) -> rquickjs::Result<()> {
     tui.draw_buf.clear();
     {
       let grid = grid.borrow();
-      tui.differ.diff(&mut tui.draw_buf, &*grid).map_err(|e| {
-        Exception::throw_message(&ctx, &format!("tui.draw: {e}"))
-      })?;
+      tui.differ.diff(&mut tui.draw_buf, &*grid);
     }
 
     let mut stdout = std::io::stdout();
-    map_io_error(&ctx, "draw", stdout.write_all(tui.draw_buf.as_bytes()))?;
+    map_io_error(&ctx, "draw", stdout.write_all(&tui.draw_buf))?;
     map_io_error(&ctx, "draw", stdout.flush())?;
     Ok(())
   })

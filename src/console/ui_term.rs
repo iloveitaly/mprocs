@@ -23,10 +23,10 @@ pub fn render_term(area: Rect, grid: &mut Grid, state: &mut State) {
   grid.draw_block(area, &chars, Attrs::default());
 
   let handle = task.present.as_ref().unwrap_or(&task.vt);
-  let Ok(parser) = handle.read() else {
+  let Ok(screen) = handle.read() else {
     return;
   };
-  let screen = parser.screen();
+  let screen = &*screen;
 
   let mut top_line = Rect {
     x: area.x + 1,

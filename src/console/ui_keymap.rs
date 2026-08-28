@@ -3,7 +3,7 @@ use crate::console::{
   keymap::{Keymap, KeymapGroup},
   state::State,
 };
-use crate::term::{Color, Grid, attrs::Attrs, encode::print_key, grid::Rect};
+use crate::term::{Color, Grid, attrs::Attrs, grid::Rect};
 
 pub fn render_keymap(
   area: Rect,
@@ -60,7 +60,7 @@ pub fn render_keymap(
       let a = Attrs::default();
       line.x = grid.draw_text(line, " <", a).right();
       line.x = grid
-        .draw_text(line, &print_key(key), Attrs::default().fg(Color::YELLOW))
+        .draw_text(line, &key.to_string(), Attrs::default().fg(Color::YELLOW))
         .right();
       line.x = grid.draw_text(line, ": ", a).right();
       line.x = grid.draw_text(line, &event.desc(), a).right();

@@ -1,19 +1,18 @@
-use std::fmt::Write;
-
-use super::{attrs::Attrs, color::Color, screen::Screen};
+use super::{attrs::Attrs, screen::Screen, vt::emit};
 
 /// Render the screen contents as ANSI-styled text, one line per row,
 /// trailing whitespace trimmed.
 pub fn render_screen_ansi(screen: &Screen) -> String {
   let size = screen.size();
-  let mut out = String::new();
+  let mut out: Vec<u8> = Vec::new();
   let mut brush = Attrs::default();
+  let mut line: Vec<u8> = Vec::new();
 
   for row in 0..size.height {
     if row > 0 {
-      let _ = write!(out, "\r\n");
+      out.extend_from_slice(b"\r\n");
     }
-    let mut line = String::new();
+    line.clear();
     let mut line_brush = brush;
 
     for col in 0..size.width {
@@ -22,87 +21,28 @@ pub fn render_screen_ansi(screen: &Screen) -> String {
         None => continue,
       };
       let attrs = *cell.attrs();
-
-      if line_brush != attrs {
-        let _ = write!(line, "\x1b[");
-        let mut first = true;
-        let mut sep = |w: &mut String| {
-          if first {
-            first = false;
-            Ok(())
-          } else {
-            write!(w, ";")
-          }
-        };
-        if line_brush.fgcolor != attrs.fgcolor {
-          let _ = sep(&mut line);
-          match attrs.fgcolor {
-            Color::Default => {
-              let _ = write!(line, "39");
-            }
-            Color::Idx(idx) => {
-              let _ = write!(line, "38;5;{}", idx);
-            }
-            Color::Rgb(r, g, b) => {
-              let _ = write!(line, "38;2;{r};{g};{b}");
-            }
-          }
-        }
-        if line_brush.bgcolor != attrs.bgcolor {
-          let _ = sep(&mut line);
-          match attrs.bgcolor {
-            Color::Default => {
-              let _ = write!(line, "49");
-            }
-            Color::Idx(idx) => {
-              let _ = write!(line, "48;5;{}", idx);
-            }
-            Color::Rgb(r, g, b) => {
-              let _ = write!(line, "48;2;{r};{g};{b}");
-            }
-          }
-        }
-        if line_brush.bold() != attrs.bold() {
-          let _ = sep(&mut line);
-          let v = if attrs.bold() { 1 } else { 22 };
-          let _ = write!(line, "{v}");
-        }
-        if line_brush.italic() != attrs.italic() {
-          let _ = sep(&mut line);
-          let v = if attrs.italic() { 3 } else { 23 };
-          let _ = write!(line, "{v}");
-        }
-        if line_brush.underline() != attrs.underline() {
-          let _ = sep(&mut line);
-          let v = if attrs.underline() { 4 } else { 24 };
-          let _ = write!(line, "{v}");
-        }
-        if line_brush.inverse() != attrs.inverse() {
-          let _ = sep(&mut line);
-          let v = if attrs.inverse() { 7 } else { 27 };
-          let _ = write!(line, "{v}");
-        }
-        let _ = write!(line, "m");
-        line_brush = attrs;
-      }
+      emit::sgr(&mut line, line_brush, attrs);
+      line_brush = attrs;
 
       let c = if cell.width() > 0 {
         cell.contents()
       } else {
         " "
       };
-      line.push_str(c);
+      line.extend_from_slice(c.as_bytes());
     }
 
-    // Trim trailing default-attrs spaces from each line
-    out.push_str(line.trim_end());
+    // Trim trailing spaces from each line
+    let trimmed =
+      line.len() - line.iter().rev().take_while(|b| **b == b' ').count();
+    out.extend_from_slice(&line[..trimmed]);
     brush = line_brush;
   }
 
   // Reset attributes at the end
   if brush != Attrs::default() {
-    let _ = write!(out, "\x1b[0m");
+    out.extend_from_slice(emit::SGR_RESET.as_bytes());
   }
 
-  out
+  String::from_utf8(out).expect("emitted ANSI is valid utf-8")
 }

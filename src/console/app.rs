@@ -48,7 +48,7 @@ use crate::{
     config_tasks::{
       register_config_tasks, spawn_config_task, unique_task_name,
     },
-    process_task::{DuplicateTask, ProcessInput},
+    process_task::{DuplicateTask, ProcessInput, ProcessPaste},
   },
   term::{
     Grid, Size, TermEvent, Winsize,
@@ -182,13 +182,9 @@ impl App {
         }
 
         for client_handle in &mut self.clients {
-          let mut out = String::new();
-          client_handle.differ.diff(&mut out, grid).log_ignore();
-          client_handle
-            .sender
-            .send_out(out.into_bytes().into())
-            .await
-            .log_ignore();
+          let mut out = Vec::new();
+          client_handle.differ.diff(&mut out, grid);
+          client_handle.sender.send_out(out.into()).await.log_ignore();
         }
       }
 
@@ -441,9 +437,14 @@ impl App {
       TermEvent::FocusLost => {
         log::debug!("Ignore input event: {:?}", event);
       }
-      TermEvent::Paste(_) => {
-        log::debug!("Ignore input event: {:?}", event);
-      }
+      TermEvent::Paste(text) => match self.state.scope {
+        Scope::Tasks => (),
+        Scope::Term | Scope::TermZoom => {
+          if let Some(task) = self.state.get_current_task() {
+            self.pc.send_msg(task.id, ProcessPaste(text));
+          }
+        }
+      },
     }
   }
 

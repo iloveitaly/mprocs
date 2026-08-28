@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use compact_str::CompactString;
 use tokio::sync::mpsc::Sender;
 
 use crate::{
@@ -9,11 +8,13 @@ use crate::{
     task::TaskId,
   },
   term::{
-    Color, MouseProtocolMode, Parser, Size, VtEvent, Winsize,
+    Color, MouseProtocolEncoding, MouseProtocolMode, Reply, Screen, Size,
+    VtEvent, Winsize,
     attrs::Attrs,
-    encode::encode_mouse_event,
     grid::{Pos as GridPos, Rect},
+    key::KeyMods,
     mouse::{MouseButton, MouseEvent, MouseEventKind},
+    vt::emit,
   },
 };
 
@@ -108,7 +109,7 @@ pub enum FramedScreenNotify {
 }
 
 pub enum TaskScreenEffect {
-  Write(CompactString),
+  Write(Vec<u8>),
   Resize(Winsize),
 }
 
@@ -119,7 +120,7 @@ impl TaskScreen {
 
   pub fn new(task_id: TaskId, vt: SharedVt, wheel_lines: usize) -> Self {
     let size = match vt.read() {
-      Ok(parser) => parser.screen().size(),
+      Ok(screen) => screen.size(),
       Err(_) => Size {
         width: 80,
         height: 24,
@@ -158,10 +159,8 @@ impl TaskScreen {
     bytes: &[u8],
     effects: &mut Vec<TaskScreenEffect>,
   ) {
-    let bytes = Bytes::copy_from_slice(bytes);
-
     if let Ok(mut vt) = self.vt.write() {
-      vt.screen.process(&bytes, &mut self.events_buf);
+      vt.process(bytes, &mut self.events_buf);
     }
 
     for event in &self.events_buf {
@@ -177,16 +176,30 @@ impl TaskScreen {
     for event in self.events_buf.drain(..) {
       match event {
         VtEvent::Bell => (),
-        VtEvent::Reply(s) => effects.push(TaskScreenEffect::Write(s)),
+        VtEvent::Reply(reply) => {
+          let mut seq = Vec::new();
+          match reply {
+            Reply::PrimaryDeviceAttrs => emit::da1_reply(&mut seq),
+            Reply::CursorPos { row, col } => emit::cpr(&mut seq, row, col),
+          }
+          effects.push(TaskScreenEffect::Write(seq));
+        }
       }
     }
 
-    for obs in &self.observers {
-      match &obs.target {
-        ObsTarget::Direct { sink, .. } => {
-          let _ = sink.send(bytes.clone()).await;
+    let has_direct = self.observers.iter().any(|o| match &o.target {
+      ObsTarget::Direct { .. } => true,
+      ObsTarget::Framed { .. } => false,
+    });
+    if has_direct {
+      let bytes = Bytes::copy_from_slice(bytes);
+      for obs in &self.observers {
+        match &obs.target {
+          ObsTarget::Direct { sink, .. } => {
+            let _ = sink.send(bytes.clone()).await;
+          }
+          ObsTarget::Framed { .. } => {}
         }
-        ObsTarget::Framed { .. } => {}
       }
     }
   }
@@ -291,9 +304,14 @@ impl TaskScreen {
     if self.copy.is_some() {
       return None;
     }
-    let snapshot = self.vt.read().ok()?.screen().clone();
-    let present =
-      SharedVt::new(Parser::new(self.size.y.max(1), self.size.x.max(1), 0));
+    let snapshot = self.vt.read().ok()?.clone();
+    let present = SharedVt::new(Screen::new(
+      Size {
+        height: self.size.y.max(1),
+        width: self.size.x.max(1),
+      },
+      0,
+    ));
     self.copy = Some(CopySession {
       state: CopyState::new(snapshot),
       present: present.clone(),
@@ -315,16 +333,27 @@ impl TaskScreen {
     event: MouseEvent,
     effects: &mut Vec<TaskScreenEffect>,
   ) {
-    let mouse_mode = self
+    let (mouse_mode, encoding) = self
       .vt
       .read()
-      .map(|p| p.screen().mouse_protocol_mode())
-      .unwrap_or(MouseProtocolMode::None);
+      .map(|screen| {
+        (
+          screen.mouse_protocol_mode(),
+          screen.mouse_protocol_encoding(),
+        )
+      })
+      .unwrap_or((MouseProtocolMode::None, MouseProtocolEncoding::Default));
 
     if mouse_mode != MouseProtocolMode::None {
-      let seq = encode_mouse_for_mode(mouse_mode, event);
-      if !seq.is_empty() {
-        effects.push(TaskScreenEffect::Write(seq.into()));
+      if mouse_forwarded(mouse_mode, event.kind) {
+        let mut event = event;
+        // X10 mode predates modifier reporting.
+        if mouse_mode == MouseProtocolMode::Press {
+          event.mods = KeyMods::NONE;
+        }
+        let mut seq = Vec::new();
+        emit::mouse(&mut seq, &event, encoding);
+        effects.push(TaskScreenEffect::Write(seq));
       }
       return;
     }
@@ -400,13 +429,11 @@ impl TaskScreen {
         session.state.scroll_down(delta.unsigned_abs() as usize);
       }
       self.render_present();
-    } else if let Ok(mut parser) = self.vt.write() {
+    } else if let Ok(mut screen) = self.vt.write() {
       if delta >= 0 {
-        parser.screen.scroll_screen_up(delta as usize);
+        screen.scroll_screen_up(delta as usize);
       } else {
-        parser
-          .screen
-          .scroll_screen_down(delta.unsigned_abs() as usize);
+        screen.scroll_screen_down(delta.unsigned_abs() as usize);
       }
     }
     self.broadcast(|task_id| FramedScreenNotify::Render { task_id });
@@ -420,15 +447,15 @@ impl TaskScreen {
       return;
     };
     let copy = &session.state;
-    let Ok(mut parser) = session.present.write() else {
+    let Ok(mut present) = session.present.write() else {
       return;
     };
     let size = Size {
       width: self.size.x.max(1),
       height: self.size.y.max(1),
     };
-    parser.set_size(size.height, size.width);
-    let grid = parser.screen.grid_mut();
+    present.set_size(size.height, size.width);
+    let grid = present.grid_mut();
     grid.set_scrollback(0);
     grid.erase_all(Attrs::default());
 
@@ -527,38 +554,40 @@ impl TaskScreen {
   }
 }
 
-fn encode_mouse_for_mode(mode: MouseProtocolMode, event: MouseEvent) -> String {
+/// Whether the child asked to receive this kind of mouse event under the
+/// mouse mode it enabled.
+fn mouse_forwarded(mode: MouseProtocolMode, kind: MouseEventKind) -> bool {
   match mode {
-    MouseProtocolMode::None => String::new(),
-    MouseProtocolMode::Press => match event.kind {
+    MouseProtocolMode::None => false,
+    MouseProtocolMode::Press => match kind {
       MouseEventKind::Down(_)
       | MouseEventKind::ScrollDown
       | MouseEventKind::ScrollUp
       | MouseEventKind::ScrollLeft
-      | MouseEventKind::ScrollRight => encode_mouse_event(event),
+      | MouseEventKind::ScrollRight => true,
       MouseEventKind::Up(_)
       | MouseEventKind::Drag(_)
-      | MouseEventKind::Moved => String::new(),
+      | MouseEventKind::Moved => false,
     },
-    MouseProtocolMode::PressRelease => match event.kind {
+    MouseProtocolMode::PressRelease => match kind {
       MouseEventKind::Down(_)
       | MouseEventKind::Up(_)
       | MouseEventKind::ScrollDown
       | MouseEventKind::ScrollUp
       | MouseEventKind::ScrollLeft
-      | MouseEventKind::ScrollRight => encode_mouse_event(event),
-      MouseEventKind::Drag(_) | MouseEventKind::Moved => String::new(),
+      | MouseEventKind::ScrollRight => true,
+      MouseEventKind::Drag(_) | MouseEventKind::Moved => false,
     },
-    MouseProtocolMode::ButtonMotion => match event.kind {
+    MouseProtocolMode::ButtonMotion => match kind {
       MouseEventKind::Down(_)
       | MouseEventKind::Up(_)
       | MouseEventKind::ScrollDown
       | MouseEventKind::Drag(_)
       | MouseEventKind::ScrollUp
       | MouseEventKind::ScrollLeft
-      | MouseEventKind::ScrollRight => encode_mouse_event(event),
-      MouseEventKind::Moved => String::new(),
+      | MouseEventKind::ScrollRight => true,
+      MouseEventKind::Moved => false,
     },
-    MouseProtocolMode::AnyMotion => encode_mouse_event(event),
+    MouseProtocolMode::AnyMotion => true,
   }
 }

@@ -25,7 +25,7 @@ use crate::{
   },
 };
 
-use super::{input_parser::InputParser, internal::InternalTermEvent};
+use super::{input::EventDecoder, internal::InternalTermEvent};
 
 pub struct WinVt {
   h_in: HANDLE,
@@ -296,12 +296,12 @@ impl Buttons {
 }
 
 fn decode_mouse_record<F: FnMut(InternalTermEvent)>(
-  input_parser: &mut InputParser,
+  decoder: &mut EventDecoder,
   event: &MOUSE_EVENT_RECORD,
   f: &mut F,
 ) {
-  let prev = Buttons(input_parser.windows_mouse_buttons);
-  input_parser.windows_mouse_buttons = event.dwButtonState;
+  let prev = Buttons(decoder.windows_mouse_buttons);
+  decoder.windows_mouse_buttons = event.dwButtonState;
 
   let btns = Buttons(event.dwButtonState);
 
@@ -370,7 +370,7 @@ fn decode_resize_record<F: FnMut(InternalTermEvent)>(
 }
 
 pub fn decode_input_records<F: FnMut(InternalTermEvent)>(
-  input_parser: &mut InputParser,
+  decoder: &mut EventDecoder,
   records: &[INPUT_RECORD],
   f: &mut F,
 ) {
@@ -396,17 +396,15 @@ pub fn decode_input_records<F: FnMut(InternalTermEvent)>(
           let mut buf = [0u8; 4];
           let bytes = ch.encode_utf8(&mut buf).as_bytes();
           for _ in 0..record.wRepeatCount {
-            input_parser.parse_input(bytes, true, true, &mut *f);
+            decoder.feed(bytes, &mut *f);
           }
         } else {
           decode_key_record(record, f);
         }
       }
-      MOUSE_EVENT => decode_mouse_record(
-        input_parser,
-        unsafe { &record.Event.MouseEvent },
-        f,
-      ),
+      MOUSE_EVENT => {
+        decode_mouse_record(decoder, unsafe { &record.Event.MouseEvent }, f)
+      }
       WINDOW_BUFFER_SIZE_EVENT => {
         decode_resize_record(unsafe { &record.Event.WindowBufferSizeEvent }, f)
       }
@@ -415,7 +413,7 @@ pub fn decode_input_records<F: FnMut(InternalTermEvent)>(
   }
 
   // Process pending ESC character.
-  input_parser.parse_input(b"", true, false, f);
+  decoder.flush(f);
 }
 
 fn modifiers_from_ctrl_key_state(state: u32) -> KeyMods {

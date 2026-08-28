@@ -16,7 +16,6 @@ use crate::kernel::kernel_message::TaskContext;
 use crate::term::{
   Color, Grid, TermEvent,
   attrs::Attrs,
-  encode::print_key,
   grid::{BorderType, Pos, Rect},
   key::{Key, KeyCode, KeyMods},
   line_symbols::{HORIZONTAL, VERTICAL_LEFT, VERTICAL_RIGHT},
@@ -38,7 +37,7 @@ impl CommandsMenuModal {
     for (event, key) in &keymap.rev_tasks {
       key_bindings
         .entry(event.clone())
-        .or_insert_with(|| print_key(key));
+        .or_insert_with(|| key.to_string());
     }
 
     CommandsMenuModal {

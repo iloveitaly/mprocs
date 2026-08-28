@@ -452,7 +452,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
           Some(content) => {
             print!("{}", content);
             // Reset terminal attributes after printing
-            print!("\x1b[0m\n");
+            println!("{}", crate::term::vt::emit::SGR_RESET);
           }
           None => anyhow::bail!("no screen content for this task"),
         }

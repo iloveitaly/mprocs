@@ -154,10 +154,16 @@ impl From<KeySpec> for Key {
 
 impl fmt::Display for KeySpec {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    let mut buf = String::new();
-    let key = self.0;
+    write!(f, "<{}>", self.0)
+  }
+}
 
-    buf.push('<');
+/// The bare key name (`C-a`, `Enter`); [`KeySpec`] wraps it in `<>` for the
+/// parseable form.
+impl fmt::Display for Key {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let mut buf = String::new();
+    let key = self;
 
     let mods = key.mods;
     if mods.intersects(KeyMods::CONTROL) {
@@ -242,8 +248,6 @@ impl fmt::Display for KeySpec {
         buf.push_str(s);
       }
     }
-
-    buf.push('>');
 
     f.write_str(&buf)
   }

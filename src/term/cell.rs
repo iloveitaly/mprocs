@@ -7,6 +7,8 @@ use unicode_width::UnicodeWidthStr;
 #[derive(Clone, Debug, Default, Eq)]
 pub struct Cell {
   text: CompactString,
+  /// Display width of `text`, kept in sync on every mutation.
+  width: u8,
   attrs: super::attrs::Attrs,
 }
 
@@ -27,6 +29,7 @@ impl Cell {
   pub fn new(content: &str) -> Cell {
     Cell {
       text: content.into(),
+      width: content.width() as u8,
       attrs: Default::default(),
     }
   }
@@ -39,12 +42,14 @@ impl Cell {
   pub(crate) fn set(&mut self, c: char, a: super::attrs::Attrs) {
     self.text.clear();
     self.text.push(c);
+    self.width = self.text.width() as u8;
     self.attrs = a;
   }
 
   pub(crate) fn set_str(&mut self, str: &str) {
     self.text.clear();
     self.text.push_str(str);
+    self.width = self.text.width() as u8;
   }
 
   pub(crate) fn append(&mut self, c: char) {
@@ -52,10 +57,12 @@ impl Cell {
       self.text.push(' ');
     }
     self.text.push(c);
+    self.width = self.text.width() as u8;
   }
 
   pub(crate) fn clear(&mut self, attrs: super::attrs::Attrs) {
     self.text.clear();
+    self.width = 0;
     self.attrs = attrs;
   }
 
@@ -78,11 +85,11 @@ impl Cell {
   /// Returns whether the text data in the cell represents a wide character.
   #[must_use]
   pub fn is_wide(&self) -> bool {
-    self.text.width() >= 2
+    self.width >= 2
   }
 
   pub fn width(&self) -> u16 {
-    self.text.width() as u16
+    self.width as u16
   }
 
   pub(crate) fn attrs(&self) -> &super::attrs::Attrs {
