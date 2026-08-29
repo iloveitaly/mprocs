@@ -2,7 +2,6 @@ use tui_input::Input;
 
 use crate::console::action::Action;
 use crate::console::{
-  client::ClientId,
   keymap::Keymap,
   widgets::text_input::{render_text_input, to_input_request},
 };
@@ -21,7 +20,7 @@ pub struct AddTaskModal {
 }
 
 impl Modal for AddTaskModal {
-  fn handle_key(&mut self, key: &Key, _client_id: ClientId) -> ModalResult {
+  fn handle_key(&mut self, key: &Key) -> ModalResult {
     match key.code {
       KeyCode::Enter if key.mods.is_empty() => {
         return ModalResult::Run(Action::AddTask {

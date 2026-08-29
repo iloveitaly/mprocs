@@ -2,6 +2,7 @@ use std::{ffi::OsString, path::PathBuf};
 
 use anyhow::{Result, bail};
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 
 use crate::cfg::{CfgCx, CfgNode, CfgObj};
 use crate::config::task_log::TaskLogConfig;
@@ -28,6 +29,7 @@ const TASK_SETTING_KEYS: &[&str] = &[
 
 /// Keys allowed on a full task entry (settings + cmd form + graph fields).
 const TASK_KEYS: &[&str] = &[
+  "label",
   "cmd",
   "shell",
   "deps",
@@ -46,12 +48,14 @@ const TASK_KEYS: &[&str] = &[
 
 /// Tag for tasks started on `dekit up` / at launch.
 pub const AUTOSTART_TAG: &str = "autostart";
-/// Tag for tasks spawned over RPC.
+/// Tag for tasks added at runtime rather than from config.
 pub const USER_TAG: &str = "user";
 
 #[derive(Clone, Default)]
 pub struct TaskConfig {
   pub path: String,
+  /// Display name; defaults to the path.
+  pub label: Option<String>,
   pub cmd: Option<CmdConfig>,
   pub deps: Vec<String>,
   pub tags: Vec<String>,
@@ -78,6 +82,7 @@ impl TaskConfig {
       } else {
         over.path
       },
+      label: over.label.or(self.label),
       cmd: over.cmd.or(self.cmd),
       deps: if over.deps.is_empty() {
         self.deps
@@ -166,6 +171,7 @@ pub(crate) fn task_from_cfg(
     bail!("task '{}': {}", path, err);
   }
   p.path = path;
+  p.label = obj.optional("label", cx)?;
   p.cmd = Some(cmd_from_cfg(node)?);
   p.deps = obj.default("deps", Vec::new(), cx)?;
   p.tags = obj.default("tags", Vec::new(), cx)?;
@@ -197,7 +203,8 @@ fn cmd_from_cfg(node: &CfgNode<'_>) -> Result<CmdConfig> {
   }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(untagged)]
 pub enum CmdConfig {
   Cmd { cmd: Vec<String> },
   Shell { shell: String },
@@ -276,8 +283,7 @@ auto_restart: true
 "#;
     let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
     let cx = CfgCx::new(PathBuf::from("."));
-    let doc =
-      CfgDoc::from_value(value, PathBuf::from("test.yaml"), &cx).unwrap();
+    let doc = CfgDoc::from_value(value, &cx).unwrap();
     let err = match task_from_cfg("web".into(), &doc.root(), &cx) {
       Ok(_) => panic!("expected unknown key error"),
       Err(e) => e.to_string(),
@@ -294,8 +300,7 @@ cwd: /tmp
 "#;
     let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
     let cx = CfgCx::new(PathBuf::from("."));
-    let doc =
-      CfgDoc::from_value(value, PathBuf::from("test.yaml"), &cx).unwrap();
+    let doc = CfgDoc::from_value(value, &cx).unwrap();
     let err = match parse_task_settings(&doc.root().as_obj().unwrap(), &cx) {
       Ok(_) => panic!("expected unknown key error"),
       Err(e) => e.to_string(),

@@ -5,7 +5,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::kernel_message::SharedVt;
+use super::kernel_message::{SharedVt, TaskSelector};
 use super::task_key::TaskSpaceId;
 use super::task_path::TaskPath;
 
@@ -63,6 +63,8 @@ pub enum TaskCmd {
   Start,
   Stop,
   Kill,
+  /// Register a copy of this task, if the task kind supports it.
+  Duplicate(Option<String>),
   Msg(Box<dyn Any + Send>),
 }
 
@@ -78,6 +80,7 @@ impl fmt::Debug for TaskCmd {
       TaskCmd::Start => write!(f, "Start"),
       TaskCmd::Stop => write!(f, "Stop"),
       TaskCmd::Kill => write!(f, "Kill"),
+      TaskCmd::Duplicate(label) => write!(f, "Duplicate({:?})", label),
       TaskCmd::Msg(_) => write!(f, "Msg(...)"),
     }
   }
@@ -183,8 +186,6 @@ pub enum RestartMode {
 
 pub struct TaskNotification {
   pub from: TaskId,
-  pub from_space: TaskSpaceId,
-  pub from_path: Option<TaskPath>,
   pub notify: TaskNotify,
 }
 
@@ -198,7 +199,6 @@ pub enum TaskNotify {
   },
   StateChanged(TaskState),
   Removed,
-  PathChanged(Option<TaskPath>, Option<TaskPath>),
   LabelChanged(Option<String>),
 }
 
@@ -212,9 +212,6 @@ impl fmt::Debug for TaskNotify {
       }
       TaskNotify::StateChanged(state) => write!(f, "StateChanged({:?})", state),
       TaskNotify::Removed => write!(f, "Removed"),
-      TaskNotify::PathChanged(old, new) => {
-        write!(f, "PathChanged({:?}, {:?})", old, new)
-      }
       TaskNotify::LabelChanged(label) => {
         write!(f, "LabelChanged({:?})", label)
       }
@@ -243,14 +240,16 @@ impl Task for ChannelTask {
 }
 
 /// A task with no process of its own; it exists to hold edges.
+#[cfg(test)]
 pub struct TargetTask;
 
+#[cfg(test)]
 impl Task for TargetTask {
   fn handle_cmd(&mut self, cmd: TaskCmd, fx: &mut Effects) {
     match cmd {
       TaskCmd::Start => fx.started(),
       TaskCmd::Stop | TaskCmd::Kill => fx.stopped(ExitInfo::code(0)),
-      TaskCmd::Msg(_) => (),
+      TaskCmd::Duplicate(_) | TaskCmd::Msg(_) => (),
     }
   }
 }
@@ -316,7 +315,9 @@ pub struct TaskDef {
   pub kind: TaskKind,
   pub ready: ReadyMode,
   pub restart: RestartMode,
-  pub deps: Vec<TaskId>,
+  /// Resolved at registration; each selector must match at least one
+  /// registered task, so the graph stays acyclic by construction.
+  pub deps: Vec<TaskSelector>,
   /// aka autostart
   pub pinned: bool,
   pub space: TaskSpaceId,

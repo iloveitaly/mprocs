@@ -43,11 +43,6 @@ impl CfgPath {
     segs.push(segment.to_string());
     Self(segs)
   }
-
-  /// Path segments for navigating the YAML tree during write-back.
-  pub fn segments(&self) -> &[String] {
-    &self.0
-  }
 }
 
 impl Display for CfgPath {
@@ -160,99 +155,28 @@ fn resolve_select<'a>(map: &'a serde_yaml::Mapping) -> Result<&'a Value> {
   }
 }
 
-/// A config document that supports both parsing and write-back.
-///
-/// Maintains two YAML trees:
-/// - **source** — the original document (with `$js`/`$select` intact), used when saving.
-/// - **resolved** — directives evaluated, used for parsing into Rust types.
+/// A config document with its `$js`/`$select` directives evaluated.
 pub struct CfgDoc {
-  source: Value,
   resolved: Value,
-  pub file_path: PathBuf,
 }
 
 impl CfgDoc {
   /// Create from a pre-parsed YAML value.
-  pub fn from_value(
-    source: Value,
-    file_path: PathBuf,
-    cx: &CfgCx,
-  ) -> Result<Self> {
+  pub fn from_value(source: Value, cx: &CfgCx) -> Result<Self> {
     let resolved = resolve_directives(&source, cx)?;
-    Ok(Self {
-      source,
-      resolved,
-      file_path,
-    })
+    Ok(Self { resolved })
   }
 
   /// Load and resolve a YAML config file.
   pub fn load(path: &Path, cx: &CfgCx) -> Result<Self> {
     let content = std::fs::read_to_string(path)?;
     let source: Value = serde_yaml::from_str(&content)?;
-    Self::from_value(source, path.to_path_buf(), cx)
+    Self::from_value(source, cx)
   }
 
   /// Root node of the resolved tree, ready for parsing.
   pub fn root(&self) -> CfgNode<'_> {
     CfgNode::new(&self.resolved, CfgPath::root())
-  }
-
-  /// Write the source document back to its file.
-  pub fn save(&self) -> Result<()> {
-    let yaml = serde_yaml::to_string(&self.source)?;
-    std::fs::write(&self.file_path, yaml)?;
-    Ok(())
-  }
-
-  /// Update a value at a path in both source and resolved trees.
-  /// Use this from TUI to persist a config change.
-  pub fn set_at(&mut self, path: &CfgPath, value: Value) {
-    set_at_path(&mut self.source, path.segments(), value.clone());
-    set_at_path(&mut self.resolved, path.segments(), value);
-  }
-
-  /// Access the original source tree.
-  pub fn source(&self) -> &Value {
-    &self.source
-  }
-}
-
-fn set_at_path(root: &mut Value, segments: &[String], value: Value) {
-  if segments.is_empty() {
-    *root = value;
-    return;
-  }
-  let (key, rest) = segments.split_first().unwrap();
-  match root {
-    Value::Mapping(map) => {
-      let yaml_key = Value::from(key.as_str());
-      if rest.is_empty() {
-        map.insert(yaml_key, value);
-      } else {
-        if map.get(&yaml_key).is_none() {
-          map.insert(
-            yaml_key.clone(),
-            Value::Mapping(serde_yaml::Mapping::new()),
-          );
-        }
-        if let Some(child) = map.get_mut(&yaml_key) {
-          set_at_path(child, rest, value);
-        }
-      }
-    }
-    Value::Sequence(seq) => {
-      if let Ok(idx) = key.parse::<usize>() {
-        if let Some(elem) = seq.get_mut(idx) {
-          if rest.is_empty() {
-            *elem = value;
-          } else {
-            set_at_path(elem, rest, value);
-          }
-        }
-      }
-    }
-    _ => {}
   }
 }
 
@@ -651,81 +575,6 @@ impl<T: FromCfg> FromCfg for IndexMap<String, T> {
       .iter()
       .map(|(k, v)| Ok((k.to_owned(), T::from_cfg(&v, cx)?)))
       .collect()
-  }
-}
-
-//
-// IntoCfg
-//
-
-pub trait IntoCfg {
-  fn into_cfg(&self) -> Value;
-}
-
-impl IntoCfg for String {
-  fn into_cfg(&self) -> Value {
-    Value::String(self.clone())
-  }
-}
-
-impl IntoCfg for &str {
-  fn into_cfg(&self) -> Value {
-    Value::String(self.to_string())
-  }
-}
-
-impl IntoCfg for bool {
-  fn into_cfg(&self) -> Value {
-    Value::Bool(*self)
-  }
-}
-
-impl IntoCfg for usize {
-  fn into_cfg(&self) -> Value {
-    Value::Number((*self as u64).into())
-  }
-}
-
-impl IntoCfg for u64 {
-  fn into_cfg(&self) -> Value {
-    Value::Number((*self).into())
-  }
-}
-
-impl IntoCfg for i64 {
-  fn into_cfg(&self) -> Value {
-    Value::Number((*self).into())
-  }
-}
-
-impl<T: IntoCfg> IntoCfg for Vec<T> {
-  fn into_cfg(&self) -> Value {
-    Value::Sequence(self.iter().map(|v| v.into_cfg()).collect())
-  }
-}
-
-impl<T: IntoCfg> IntoCfg for Option<T> {
-  fn into_cfg(&self) -> Value {
-    match self {
-      Some(v) => v.into_cfg(),
-      None => Value::Null,
-    }
-  }
-}
-
-impl<T: IntoCfg> IntoCfg for IndexMap<String, T> {
-  fn into_cfg(&self) -> Value {
-    let mut map = serde_yaml::Mapping::new();
-    for (k, v) in self {
-      map.insert(Value::String(k.clone()), v.into_cfg());
-    }
-    Value::Mapping(map)
-  }
-}
-
-impl IntoCfg for Value {
-  fn into_cfg(&self) -> Value {
-    self.clone()
   }
 }
 

@@ -10,6 +10,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub fn local_hello() -> Hello {
   Hello {
     protocol: PROTOCOL_VERSION,
+    version: env!("CARGO_PKG_VERSION").to_string(),
     app: format!("dekit {}", env!("CARGO_PKG_VERSION")),
     features: Vec::new(),
   }
@@ -28,6 +29,9 @@ pub enum CtlMsg {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Hello {
   pub protocol: u32,
+  /// The peer's semver, for machines; `app` is for humans.
+  #[serde(default)]
+  pub version: String,
   #[serde(default)]
   pub app: String,
   #[serde(default)]
@@ -120,7 +124,9 @@ pub mod codes {
   pub const UNKNOWN_METHOD: &str = "unknown_method";
   pub const INVALID_PARAMS: &str = "invalid_params";
   pub const NO_MATCH: &str = "no_match";
-  pub const BAD_PATH: &str = "bad_path";
+  /// More than one task matched where exactly one is needed.
+  pub const AMBIGUOUS: &str = "ambiguous";
+  pub const BAD_TARGET: &str = "bad_target";
   pub const PATH_TAKEN: &str = "path_taken";
   pub const NO_SCREEN: &str = "no_screen";
   pub const INTERNAL: &str = "internal";
@@ -130,6 +136,8 @@ pub mod codes {
 
 /// Client-to-server event carrying a terminal input event.
 pub const EVENT_INPUT: &str = "input";
+/// Client-to-server event carrying a `ScreenCommand`.
+pub const EVENT_SCREEN: &str = "screen";
 
 #[cfg(test)]
 mod tests {
@@ -152,10 +160,11 @@ mod tests {
       (
         CtlMsg::Hello(Hello {
           protocol: 1,
+          version: "0.9.6".to_string(),
           app: "dekit 0.9.6".to_string(),
           features: vec![],
         }),
-        r#"{"type":"hello","protocol":1,"app":"dekit 0.9.6","features":[]}"#,
+        r#"{"type":"hello","protocol":1,"version":"0.9.6","app":"dekit 0.9.6","features":[]}"#,
       ),
       (
         CtlMsg::Request(Request {
@@ -256,6 +265,7 @@ mod tests {
       decoded,
       CtlMsg::Hello(Hello {
         protocol: 1,
+        version: String::new(),
         app: String::new(),
         features: vec![],
       })

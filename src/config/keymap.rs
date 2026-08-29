@@ -44,6 +44,17 @@ impl KeymapConfig {
     Ok(())
   }
 
+  pub fn group_mut(
+    &mut self,
+    group: KeymapGroup,
+  ) -> &mut IndexMap<Key, Action> {
+    match group {
+      KeymapGroup::Tasks => &mut self.keymap_tasks,
+      KeymapGroup::Term => &mut self.keymap_term,
+      KeymapGroup::Copy => &mut self.keymap_copy,
+    }
+  }
+
   pub fn add_defaults(&mut self) {
     let s = self;
 
@@ -256,9 +267,60 @@ fn add_keys(
     if event.is_null() {
       into.shift_remove(&key);
     } else {
-      let event: Action = serde_yaml::from_value(event.raw().clone())?;
+      let raw = event.raw().clone();
+      // `q: quit` is shorthand for `q: {action: quit}`.
+      let raw = match raw {
+        serde_yaml::Value::String(name) => {
+          let mut map = serde_yaml::Mapping::new();
+          map.insert("action".into(), name.into());
+          serde_yaml::Value::Mapping(map)
+        }
+        raw => raw,
+      };
+      let event: Action = serde_yaml::from_value(raw)?;
       into.insert(key, event);
     }
   }
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use crate::cfg::{CfgCx, CfgDoc};
+
+  use super::*;
+
+  #[test]
+  fn config_spellings() {
+    let yaml = r#"
+keymap:
+  tasks:
+    <q>: quit
+    <C-d>: {action: scroll-down, n: 3, unit: line}
+    <C-u>: scroll-up
+    <j>: null
+"#;
+    let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+    let cx = CfgCx::new(std::path::PathBuf::from("."));
+    let doc = CfgDoc::from_value(value, &cx).unwrap();
+    let mut config = KeymapConfig::default();
+    config.merge(&doc.root().as_obj().unwrap()).unwrap();
+    let key = |s: &str| KeySpec::parse(s).unwrap().key();
+    assert_eq!(config.keymap_tasks.get(&key("<q>")), Some(&Action::Quit));
+    assert_eq!(
+      config.keymap_tasks.get(&key("<C-d>")),
+      Some(&Action::ScrollDown {
+        n: 3,
+        unit: ScrollUnit::Line
+      })
+    );
+    assert_eq!(
+      config.keymap_tasks.get(&key("<C-u>")),
+      Some(&Action::ScrollUp {
+        n: 1,
+        unit: ScrollUnit::HalfScreen
+      })
+    );
+    assert_eq!(config.keymap_tasks.get(&key("<j>")), None);
+  }
 }

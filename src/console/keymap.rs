@@ -16,7 +16,7 @@ pub struct Keymap {
   copy: Bindings,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KeymapGroup {
   Tasks,
   Term,

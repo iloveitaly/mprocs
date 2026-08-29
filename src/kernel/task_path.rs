@@ -18,7 +18,7 @@ impl fmt::Display for InvalidPath {
 
 impl std::error::Error for InvalidPath {}
 
-fn is_valid_component_char(c: char) -> bool {
+pub fn is_valid_component_char(c: char) -> bool {
   c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
 }
 

@@ -20,5 +20,6 @@ pub enum KeyboardMode {
   Unknown,
   ModifyOtherKeys,
   Kitty,
+  #[cfg_attr(not(windows), allow(dead_code))]
   Win32,
 }

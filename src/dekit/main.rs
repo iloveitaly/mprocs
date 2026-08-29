@@ -1,20 +1,22 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
-use clap::{Arg, Command};
+use clap::{Arg, Command as ClapCommand};
 use rquickjs::CatchResultExt;
 
 use crate::{
   attach_client::client_main,
+  command::Command,
+  config::task::{AUTOSTART_TAG, CmdConfig},
   daemon::{
     lockfile, socket::connect_client_socket, spawn::spawn_server_daemon,
   },
   dekit::{rpc_client::rpc_request, server::run_server},
   js::js_vm::JsVm,
   protocol::{
-    ActResult, RpcRequest, RpcState, RpcWhy, ScreenResult, SpawnResult,
-    TaskListResult,
+    ActResult, RpcRequest, RpcState, RpcWhy, ScreenResult, TaskListResult,
   },
+  target::{Runner, Target},
 };
 
 /// Render a wire state (token + optional exit detail) for humans.
@@ -105,12 +107,24 @@ fn print_why(result: serde_json::Value, json: bool) -> anyhow::Result<()> {
   Ok(())
 }
 
+/// `--chdir`, else the nearest dir with a dekit.yaml at or above the
+/// current dir, else the current dir.
 fn resolve_working_dir(matches: &clap::ArgMatches) -> anyhow::Result<PathBuf> {
   match matches.get_one::<String>("chdir") {
     Some(dir) => std::fs::canonicalize(dir)
       .map_err(|e| anyhow!("invalid --chdir `{}`: {}", dir, e)),
-    None => Ok(std::env::current_dir()?),
+    None => {
+      let cwd = std::env::current_dir()?;
+      Ok(find_project_dir(&cwd).unwrap_or(cwd))
+    }
   }
+}
+
+fn find_project_dir(from: &Path) -> Option<PathBuf> {
+  from
+    .ancestors()
+    .find(|dir| dir.join("dekit.yaml").is_file())
+    .map(Path::to_path_buf)
 }
 
 async fn shutdown_daemon(working_dir: &Path) -> anyhow::Result<()> {
@@ -123,7 +137,8 @@ async fn shutdown_daemon(working_dir: &Path) -> anyhow::Result<()> {
     Some(_) => {}
   }
 
-  let _ = rpc_request(working_dir, RpcRequest::Shutdown {}, false).await;
+  let _ =
+    rpc_request(working_dir, RpcRequest::Command(Command::Quit), false).await;
 
   for _ in 0..50 {
     match lockfile::get_daemon_status(working_dir)? {
@@ -181,32 +196,87 @@ async fn wait_for_daemon(working_dir: &Path) -> anyhow::Result<()> {
   anyhow::bail!("daemon did not come up within 2s");
 }
 
+fn arg_target(sub_m: &clap::ArgMatches) -> anyhow::Result<Option<Target>> {
+  sub_m
+    .get_one::<String>("target")
+    .map(|target| target.parse::<Target>().map_err(Into::into))
+    .transpose()
+}
+
+/// Resolves a target's runner to the working dir to talk to, and returns
+/// the target as the runner sees it.
+fn resolve_target(
+  matches: &clap::ArgMatches,
+  target: Target,
+) -> anyhow::Result<(PathBuf, Target)> {
+  let chdir = matches.get_one::<String>("chdir");
+  let working_dir = match (target.runner(), chdir) {
+    (Some(_), Some(_)) => {
+      anyhow::bail!("use either --chdir or a runner qualifier, not both")
+    }
+    (None, _) => resolve_working_dir(matches)?,
+    (Some(Runner::Name(name)), None) => match name.as_str() {
+      "project" => match find_project_dir(&std::env::current_dir()?) {
+        Some(dir) => dir,
+        None => anyhow::bail!("no dekit.yaml found above the current dir"),
+      },
+      "user" => anyhow::bail!("the OS-user runner is not available yet"),
+      other => anyhow::bail!("unknown runner '{}'", other),
+    },
+    (Some(Runner::Path(path)), None) => {
+      let path = match path.strip_prefix("~/") {
+        Some(rest) => match std::env::var_os("HOME") {
+          Some(home) => PathBuf::from(home).join(rest),
+          None => anyhow::bail!("HOME is not set"),
+        },
+        None => PathBuf::from(path),
+      };
+      std::fs::canonicalize(&path).map_err(|e| {
+        anyhow!("invalid runner path `{}`: {}", path.display(), e)
+      })?
+    }
+    (Some(Runner::Url(url)), None) => {
+      anyhow::bail!("remote runners are not available yet: {}", url)
+    }
+  };
+  Ok((working_dir, target.without_runner()))
+}
+
 pub async fn dekit_main() -> anyhow::Result<()> {
+  let target_arg = |help: &'static str| Arg::new("target").help(help);
+  let required_target = || {
+    Arg::new("target")
+      .required(true)
+      .help("Task path, glob, or +tag")
+  };
   let cmd = clap::command!()
     .subcommands([
-      Command::new("tui")
-        .about("Open the TUI")
-        .subcommand(
-          Command::new("attach")
-            .about("Attach to the running daemon without starting it"),
+      ClapCommand::new("attach")
+        .about("Attach the terminal to a task's screen (default: the console)")
+        .arg(target_arg("Task screen to attach to"))
+        .arg(
+          Arg::new("no-start")
+            .long("no-start")
+            .action(clap::ArgAction::SetTrue)
+            .help("Fail if the server is not running instead of starting it"),
         ),
-      Command::new("up")
-        .about("Start autostart tasks, or tasks matching a pattern")
-        .arg(Arg::new("pattern").help("Task path, glob, or +tag")),
-      Command::new("down")
+      ClapCommand::new("up")
+        .about("Start autostart tasks, or tasks matching a target")
+        .arg(target_arg("Task path, glob, or +tag")),
+      ClapCommand::new("down")
         .about("Unpin tasks (bare: all); each stops unless something still needs it")
-        .arg(Arg::new("pattern").help("Task path, glob, or +tag")),
-      Command::new("spawn")
+        .arg(target_arg("Task path, glob, or +tag")),
+      ClapCommand::new("spawn")
         .about("Add a task at a path and start it")
         .arg(
-          Arg::new("path")
+          Arg::new("target")
             .required(true)
             .help("Task path (e.g. services/web)"),
         )
         .arg(
           Arg::new("cwd")
             .long("cwd")
-            .help("Working directory for the task"),
+            .help("Working directory for the task (default: current dir)"),
         )
         .arg(
           Arg::new("env")
@@ -218,7 +288,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
           Arg::new("dep")
             .long("dep")
             .action(clap::ArgAction::Append)
-            .help("Depend on an existing task path (repeatable)"),
+            .help("Depend on existing tasks matching a target (repeatable)"),
         )
         .arg(
           Arg::new("tag")
@@ -233,34 +303,37 @@ pub async fn dekit_main() -> anyhow::Result<()> {
             .last(true)
             .help("Command to run"),
         ),
-      Command::new("ls")
+      ClapCommand::new("ls")
         .about("List tasks")
-        .arg(Arg::new("pattern").help("Optional path or glob")),
-      Command::new("start")
-        .about("Start tasks matching a path or glob")
-        .arg(Arg::new("pattern").required(true).help("Task path, glob, or +tag")),
-      Command::new("stop")
+        .arg(target_arg("Task path, glob, or +tag (default: everything)")),
+      ClapCommand::new("start")
+        .about("Start tasks matching a target")
+        .arg(required_target()),
+      ClapCommand::new("stop")
         .about("Unpin and stop tasks; each restarts if something still needs it")
-        .arg(Arg::new("pattern").required(true).help("Task path, glob, or +tag")),
-      Command::new("kill")
+        .arg(required_target()),
+      ClapCommand::new("kill")
         .about("Like stop, but with an immediate hard kill")
-        .arg(Arg::new("pattern").required(true).help("Task path, glob, or +tag")),
-      Command::new("veto")
+        .arg(required_target()),
+      ClapCommand::new("veto")
         .about("Force tasks down and keep them down until started again")
-        .arg(Arg::new("pattern").required(true).help("Task path, glob, or +tag")),
-      Command::new("restart")
-        .about("Restart tasks matching a path or glob")
-        .arg(Arg::new("pattern").required(true).help("Task path, glob, or +tag")),
-      Command::new("why")
+        .arg(required_target()),
+      ClapCommand::new("restart")
+        .about("Restart tasks matching a target")
+        .arg(required_target()),
+      ClapCommand::new("rm")
+        .about("Remove tasks, killing running ones")
+        .arg(required_target()),
+      ClapCommand::new("why")
         .about("Explain why a task is (not) running")
-        .arg(Arg::new("path").required(true).help("Task path")),
-      Command::new("screen")
+        .arg(Arg::new("target").required(true).help("Task path")),
+      ClapCommand::new("screen")
         .about("Print the current screen of a task")
-        .arg(Arg::new("path").required(true).help("Task path")),
-      Command::new("server")
+        .arg(Arg::new("target").required(true).help("Task path")),
+      ClapCommand::new("server")
         .about("Manage the background server")
         .subcommands([
-        Command::new("run")
+        ClapCommand::new("run")
           .about("Run the daemon in the foreground")
           .arg(
             Arg::new("dir")
@@ -273,15 +346,15 @@ pub async fn dekit_main() -> anyhow::Result<()> {
               .long("log-level")
               .help("Diagnostic log level (off|error|warn|info|debug|trace, or env_logger spec). Falls back to $DEKIT_LOG, $RUST_LOG, then 'error' (release) or 'trace' (debug)."),
           ),
-        Command::new("start")
+        ClapCommand::new("start")
           .about("Start the server for the current directory"),
-        Command::new("stop").about("Stop the server for the current directory"),
-        Command::new("status")
+        ClapCommand::new("stop").about("Stop the server for the current directory"),
+        ClapCommand::new("status")
           .about("Show server status for the current directory"),
-        Command::new("list").about("List all servers on this machine"),
-        Command::new("clean").about("Remove stale lock files"),
+        ClapCommand::new("list").about("List all servers on this machine"),
+        ClapCommand::new("clean").about("Remove stale lock files"),
       ]),
-      Command::new("mprocs")
+      ClapCommand::new("mprocs")
         .about("Run the legacy mprocs CLI (mprocs.yaml, --ctl, etc.)")
         .disable_help_flag(true)
         .arg(
@@ -296,7 +369,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         .long("chdir")
         .short('C')
         .global(true)
-        .help("Directory whose server to talk to (default: current dir)"),
+        .help("Directory whose server to talk to (default: the nearest dekit.yaml dir, else the current dir)"),
     )
     .arg(
       Arg::new("json")
@@ -309,14 +382,15 @@ pub async fn dekit_main() -> anyhow::Result<()> {
       Arg::new("files")
         .action(clap::ArgAction::Append)
         .trailing_var_arg(true)
-        .help("A .js script to run; with no command, launch the TUI"),
+        .help("A .js script to run; with no command, attach to the console"),
     )
     .after_help(
-      "SELECTORS\n  \
-       A pattern is a task path (services/web), a glob (services/*), or\n  \
-       a +tag (+backend). The surgical verbs (start, stop, kill, veto,\n  \
-       restart) require a pattern; the workday verbs (up, down) default to\n  \
-       the autostart set / everything.\n\
+      "TARGETS\n  \
+       A target is a task path (services/web), a glob (services/*, **), or\n  \
+       a +tag (+backend), optionally in a space (@dekit/console, @*/web)\n  \
+       and a runner (project::web, /abs/dir::+ci). The surgical verbs\n  \
+       (start, stop, kill, veto, restart, rm) require a target; the workday\n  \
+       verbs (up, down) default to the autostart set / everything.\n\
        \n\
        BRINGING TASKS DOWN\n  \
        stop  unpins and stops now; a task restarts if a dependent still needs it.\n  \
@@ -337,29 +411,43 @@ pub async fn dekit_main() -> anyhow::Result<()> {
     return crate::mprocs::mprocs::run_app(argv).await;
   }
 
+  let console = || "@dekit/console".parse::<Target>().expect("valid target");
+
   match matches.subcommand() {
-    Some(("tui", sub_m)) => {
-      let working_dir = resolve_working_dir(&matches)?;
-      let spawn = !matches!(sub_m.subcommand(), Some(("attach", _)));
+    Some(("attach", sub_m)) => {
+      let target = arg_target(sub_m)?.unwrap_or_else(console);
+      let (working_dir, target) = resolve_target(&matches, target)?;
+      let start = !sub_m.get_flag("no-start");
       let (sender, receiver) =
-        connect_client_socket(&working_dir, spawn).await?;
-      client_main(sender, receiver).await?;
+        connect_client_socket(&working_dir, start).await?;
+      client_main(target, sender, receiver).await?;
     }
     Some(("spawn", sub_m)) => {
-      let working_dir = resolve_working_dir(&matches)?;
-      let path = sub_m.get_one::<String>("path").unwrap().clone();
-      let cwd = sub_m.get_one::<String>("cwd").cloned();
+      let target = arg_target(sub_m)?.expect("clap requires target");
+      let (working_dir, target) = resolve_target(&matches, target)?;
+      let cwd = match sub_m.get_one::<String>("cwd") {
+        Some(cwd) => cwd.clone(),
+        None => std::env::current_dir()?.to_string_lossy().into_owned(),
+      };
       let cmd: Vec<String> =
         sub_m.get_many::<String>("cmd").unwrap().cloned().collect();
-      let deps: Vec<String> = sub_m
+      let deps = sub_m
         .get_many::<String>("dep")
-        .map(|v| v.cloned().collect())
-        .unwrap_or_default();
+        .into_iter()
+        .flatten()
+        .map(|dep| {
+          let dep = dep.parse::<Target>()?;
+          if dep.runner().is_some() {
+            anyhow::bail!("dep '{}': deps live in the task's own runner", dep);
+          }
+          Ok(dep)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
       let tags: Vec<String> = sub_m
         .get_many::<String>("tag")
         .map(|v| v.cloned().collect())
         .unwrap_or_default();
-      let mut env = indexmap::IndexMap::new();
+      let mut env = std::collections::BTreeMap::new();
       if let Some(vals) = sub_m.get_many::<String>("env") {
         for val in vals {
           let (k, v) = val
@@ -368,108 +456,97 @@ pub async fn dekit_main() -> anyhow::Result<()> {
           env.insert(k.to_string(), Some(v.to_string()));
         }
       }
-      let env = if env.is_empty() { None } else { Some(env) };
-      let result = rpc_request(
-        &working_dir,
-        RpcRequest::Spawn {
-          path,
-          cmd,
-          cwd,
-          env,
-          deps,
-          tags,
-        },
-        true,
-      )
-      .await?;
+      let name = target.to_string();
+      let command = Command::Add {
+        target,
+        label: None,
+        cmd: CmdConfig::Cmd { cmd },
+        cwd: Some(cwd),
+        env: if env.is_empty() { None } else { Some(env) },
+        deps,
+        tags,
+      };
+      let result =
+        rpc_request(&working_dir, RpcRequest::Command(command), true).await?;
       if json {
         println!("{}", serde_json::to_string(&result)?);
       } else {
-        let spawned: SpawnResult = serde_json::from_value(result)?;
-        println!("Spawned {}.", spawned.path);
+        println!("Spawned {}.", name);
       }
     }
     Some(("ls", sub_m)) => {
-      let working_dir = resolve_working_dir(&matches)?;
-      let pattern = sub_m.get_one::<String>("pattern").cloned();
-      let result =
-        rpc_request(&working_dir, RpcRequest::Ls { pattern }, false).await?;
+      let target = arg_target(sub_m)?.unwrap_or_else(|| Target::glob("**"));
+      let (working_dir, target) = resolve_target(&matches, target)?;
+      let result = rpc_request(
+        &working_dir,
+        RpcRequest::Ls {
+          target: Some(target),
+        },
+        false,
+      )
+      .await?;
       print_task_list(result, json)?;
     }
-    Some(("start", sub_m)) => {
-      let working_dir = resolve_working_dir(&matches)?;
-      let pattern = sub_m.get_one::<String>("pattern").unwrap().clone();
+    Some((
+      verb @ ("start" | "stop" | "kill" | "veto" | "restart" | "rm"),
+      sub_m,
+    )) => {
+      let target = arg_target(sub_m)?.expect("clap requires target");
+      let (working_dir, target) = resolve_target(&matches, target)?;
+      let (command, spawn, done) = match verb {
+        "start" => (Command::Start { target }, true, "Started"),
+        "stop" => (Command::Stop { target }, false, "Stopped"),
+        "kill" => (Command::Kill { target }, false, "Killed"),
+        "veto" => (Command::Veto { target }, false, "Vetoed"),
+        "restart" => (Command::Restart { target }, true, "Restarted"),
+        _ => (Command::Remove { target }, false, "Removed"),
+      };
       let result =
-        rpc_request(&working_dir, RpcRequest::Start { pattern }, true).await?;
-      print_acted(result, json, "Started", "No tasks matched.")?;
-    }
-    Some(("stop", sub_m)) => {
-      let working_dir = resolve_working_dir(&matches)?;
-      let pattern = sub_m.get_one::<String>("pattern").unwrap().clone();
-      let result =
-        rpc_request(&working_dir, RpcRequest::Stop { pattern }, false).await?;
-      print_acted(result, json, "Stopped", "No tasks matched.")?;
-    }
-    Some(("kill", sub_m)) => {
-      let working_dir = resolve_working_dir(&matches)?;
-      let pattern = sub_m.get_one::<String>("pattern").unwrap().clone();
-      let result =
-        rpc_request(&working_dir, RpcRequest::Kill { pattern }, false).await?;
-      print_acted(result, json, "Killed", "No tasks matched.")?;
-    }
-    Some(("veto", sub_m)) => {
-      let working_dir = resolve_working_dir(&matches)?;
-      let pattern = sub_m.get_one::<String>("pattern").unwrap().clone();
-      let result =
-        rpc_request(&working_dir, RpcRequest::Veto { pattern }, false).await?;
-      print_acted(result, json, "Vetoed", "No tasks matched.")?;
-    }
-    Some(("restart", sub_m)) => {
-      let working_dir = resolve_working_dir(&matches)?;
-      let pattern = sub_m.get_one::<String>("pattern").unwrap().clone();
-      let result =
-        rpc_request(&working_dir, RpcRequest::Restart { pattern }, true)
-          .await?;
-      print_acted(result, json, "Restarted", "No tasks matched.")?;
+        rpc_request(&working_dir, RpcRequest::Command(command), spawn).await?;
+      print_acted(result, json, done, "No tasks matched.")?;
     }
     Some(("why", sub_m)) => {
-      let working_dir = resolve_working_dir(&matches)?;
-      let path = sub_m.get_one::<String>("path").unwrap().clone();
+      let target = arg_target(sub_m)?.expect("clap requires target");
+      let (working_dir, target) = resolve_target(&matches, target)?;
       let result =
-        rpc_request(&working_dir, RpcRequest::Why { path }, false).await?;
+        rpc_request(&working_dir, RpcRequest::Why { target }, false).await?;
       print_why(result, json)?;
     }
     Some(("screen", sub_m)) => {
-      let working_dir = resolve_working_dir(&matches)?;
-      let path = sub_m.get_one::<String>("path").unwrap().clone();
+      let target = arg_target(sub_m)?.expect("clap requires target");
+      let (working_dir, target) = resolve_target(&matches, target)?;
       let result =
-        rpc_request(&working_dir, RpcRequest::Screen { path }, false).await?;
+        rpc_request(&working_dir, RpcRequest::Screen { target }, false).await?;
       let screen: ScreenResult = serde_json::from_value(result)?;
       if json {
         println!("{}", serde_json::to_string(&screen)?);
       } else {
-        match screen.screen {
-          Some(content) => {
-            print!("{}", content);
-            // Reset terminal attributes after printing
-            println!("{}", crate::term::vt::emit::SGR_RESET);
-          }
-          None => anyhow::bail!("no screen content for this task"),
-        }
+        print!("{}", screen.screen);
+        // Reset terminal attributes after printing
+        println!("{}", crate::term::vt::emit::SGR_RESET);
       }
     }
     Some(("up", sub_m)) => {
-      let working_dir = resolve_working_dir(&matches)?;
-      let pattern = sub_m.get_one::<String>("pattern").cloned();
-      let result =
-        rpc_request(&working_dir, RpcRequest::Up { pattern }, true).await?;
+      let target =
+        arg_target(sub_m)?.unwrap_or_else(|| Target::tag(AUTOSTART_TAG));
+      let (working_dir, target) = resolve_target(&matches, target)?;
+      let result = rpc_request(
+        &working_dir,
+        RpcRequest::Command(Command::Start { target }),
+        true,
+      )
+      .await?;
       print_acted(result, json, "Started", "No tasks matched.")?;
     }
     Some(("down", sub_m)) => {
-      let working_dir = resolve_working_dir(&matches)?;
-      let pattern = sub_m.get_one::<String>("pattern").cloned();
-      let result =
-        rpc_request(&working_dir, RpcRequest::Down { pattern }, false).await?;
+      let target = arg_target(sub_m)?.unwrap_or_else(|| Target::glob("**"));
+      let (working_dir, target) = resolve_target(&matches, target)?;
+      let result = rpc_request(
+        &working_dir,
+        RpcRequest::Command(Command::Down { target }),
+        false,
+      )
+      .await?;
       print_acted(result, json, "Put down", "No tasks matched.")?;
     }
     Some(("server", sub_m)) => match sub_m.subcommand() {
@@ -573,11 +650,11 @@ pub async fn dekit_main() -> anyhow::Result<()> {
           );
         }
       } else {
-        // No args: same as `tui`.
+        // No args: same as `attach`.
         let working_dir = resolve_working_dir(&matches)?;
         let (sender, receiver) =
           connect_client_socket(&working_dir, true).await?;
-        client_main(sender, receiver).await?;
+        client_main(console(), sender, receiver).await?;
       }
     }
   }

@@ -1,7 +1,7 @@
 use unicode_width::UnicodeWidthStr;
 
 use super::{
-  Cell,
+  Cell, Screen,
   attrs::Attrs,
   common::{CursorStyle, Size},
   grid::{Grid, Pos},
@@ -156,6 +156,28 @@ impl BufferView for Grid {
 
   fn get_cursor_style(&self) -> CursorStyle {
     self.cursor_style
+  }
+}
+
+impl BufferView for Screen {
+  fn size(&self) -> Size {
+    self.size()
+  }
+
+  fn get_cell(&self, pos: Pos) -> Option<&Cell> {
+    self.cell(pos.row, pos.col)
+  }
+
+  fn get_cursor_pos(&self) -> Option<Pos> {
+    if self.hide_cursor() {
+      return None;
+    }
+    let (row, col) = self.cursor_position();
+    Some(Pos { row, col })
+  }
+
+  fn get_cursor_style(&self) -> CursorStyle {
+    self.cursor_style()
   }
 }
 

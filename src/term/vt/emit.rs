@@ -184,6 +184,13 @@ pub fn paste(out: &mut Vec<u8>, text: &str, bracketed: bool) {
   }
 }
 
+/// OSC 2: set the window title.
+pub fn osc_title(out: &mut Vec<u8>, title: &str) {
+  out.extend_from_slice(b"\x1b]2;");
+  out.extend_from_slice(title.as_bytes());
+  out.push(0x07);
+}
+
 /// OSC 52: copy text to the clipboard through the outer terminal.
 pub fn osc52_copy(out: &mut Vec<u8>, text: &str) {
   out.extend_from_slice(b"\x1b]52;;");
@@ -480,16 +487,6 @@ pub fn key(out: &mut Vec<u8>, key: &Key, modes: KeyEncodeModes) {
 fn push_char(out: &mut Vec<u8>, c: char) {
   let mut buf = [0u8; 4];
   out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-}
-
-/// characters that when masked for CTRL could be an ascii control character
-/// or could be a key that a user legitimately wants to process in their
-/// terminal application
-fn is_ambiguous_ascii_ctrl(c: char) -> bool {
-  match c {
-    'i' | 'I' | 'm' | 'M' | '[' | '{' | '@' => true,
-    _ => false,
-  }
 }
 
 fn csi_u_key(out: &mut Vec<u8>, c: char, mods: KeyMods, csi_u: bool) {

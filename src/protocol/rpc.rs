@@ -1,98 +1,41 @@
-use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::command::Command;
+use crate::kernel::task::TaskId;
 use crate::protocol::ctl::{RpcError, codes};
+use crate::target::Target;
 
-/// Variants without fields stay `{}`-style so foreign clients sending
-/// `params: {}` still parse.
+/// Mutations travel as one `command` method whose params are a `Command`
+/// verbatim; queries and screen attachment are methods of their own.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum RpcRequest {
-  TuiAttach {
+  Command(Command),
+  Ls {
+    /// Defaults to every task in the default space (`**`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target: Option<Target>,
+  },
+  /// Explain why one task is (not) running.
+  Why {
+    target: Target,
+  },
+  /// The current screen of one task, rendered as ANSI text.
+  Screen {
+    target: Target,
+  },
+  /// Attach to one task's screen for the rest of the connection.
+  Attach {
+    target: Target,
     width: u16,
     height: u16,
   },
-  /// Register a task at a path and start it. `deps` are paths that must
-  /// already exist.
-  Spawn {
-    path: String,
-    cmd: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cwd: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    env: Option<IndexMap<String, Option<String>>>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    deps: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    tags: Vec<String>,
-  },
-  Ls {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pattern: Option<String>,
-  },
-  /// Pin matching tasks to init and start them. Without a pattern, start
-  /// autostart tasks.
-  Up {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pattern: Option<String>,
-  },
-  /// Pin matching tasks to init and start them.
-  ///
-  /// All pattern verbs resolve the pattern and act on the matches in a
-  /// single kernel dispatch; `no_match` means zero matches at act time.
-  Start {
-    pattern: String,
-  },
-  /// Unpin matching tasks and stop their running instances; each comes
-  /// back if something still wants it.
-  Stop {
-    pattern: String,
-  },
-  /// Unpin matching tasks; each stops only if nothing else wants it.
-  /// Without a pattern, unpin every task.
-  Down {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pattern: Option<String>,
-  },
-  /// Like `Stop` but with an immediate hard kill.
-  Kill {
-    pattern: String,
-  },
-  /// Veto matching tasks: they stay down until started again.
-  Veto {
-    pattern: String,
-  },
-  Restart {
-    pattern: String,
-  },
-  /// Explain why a task is (not) running.
-  Why {
-    path: String,
-  },
-  Screen {
-    path: String,
-  },
-  Shutdown {},
 }
 
 /// Gate for `from_wire`: methods not listed here are `unknown_method`
 /// instead of `invalid_params`. Kept in sync with the enum by tests.
-const METHODS: &[&str] = &[
-  "tui_attach",
-  "spawn",
-  "ls",
-  "up",
-  "start",
-  "stop",
-  "down",
-  "kill",
-  "veto",
-  "restart",
-  "why",
-  "screen",
-  "shutdown",
-];
+const METHODS: &[&str] = &["command", "ls", "why", "screen", "attach"];
 
 impl RpcRequest {
   pub fn to_wire(&self) -> (String, Value) {
@@ -137,17 +80,12 @@ pub fn ok_result() -> Value {
   json!({})
 }
 
-/// Result of a selector verb: how many tasks it acted on. Zero is a
-/// normal outcome (the pattern matched nothing), not an error, so the
+/// Result of a task-directed command: how many tasks it acted on. Zero
+/// is a normal outcome (the target matched nothing), not an error, so the
 /// client can decide how to report it.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ActResult {
   pub matched: usize,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct SpawnResult {
-  pub path: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -157,7 +95,7 @@ pub struct TaskListResult {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ScreenResult {
-  pub screen: Option<String>,
+  pub screen: String,
 }
 
 /// A task's lifecycle state on the wire: a stable token, plus the exit
@@ -172,8 +110,11 @@ pub struct RpcState {
   pub signal: Option<i32>,
 }
 
+/// `path` is the space-qualified target of the task (`@dekit/console`),
+/// or `<task:id>` for a task without one.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RpcTaskInfo {
+  pub id: TaskId,
   pub path: String,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub label: Option<String>,
@@ -183,6 +124,7 @@ pub struct RpcTaskInfo {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RpcWhy {
+  pub id: TaskId,
   pub path: String,
   #[serde(flatten)]
   pub state: RpcState,
@@ -206,67 +148,42 @@ pub struct RpcWhyDep {
 
 #[cfg(test)]
 mod tests {
+  use crate::config::task::CmdConfig;
+
   use super::*;
 
   fn samples() -> Vec<RpcRequest> {
     vec![
-      RpcRequest::TuiAttach {
+      RpcRequest::Command(Command::Start {
+        target: Target::glob("web"),
+      }),
+      RpcRequest::Command(Command::Add {
+        target: Target::glob("api"),
+        label: None,
+        cmd: CmdConfig::Cmd {
+          cmd: vec!["./api".to_string()],
+        },
+        cwd: Some("/repo".to_string()),
+        env: None,
+        deps: vec![Target::glob("db")],
+        tags: vec!["backend".to_string()],
+      }),
+      RpcRequest::Command(Command::Quit),
+      RpcRequest::Ls { target: None },
+      RpcRequest::Ls {
+        target: Some(Target::glob("services/*")),
+      },
+      RpcRequest::Why {
+        target: Target::glob("web"),
+      },
+      RpcRequest::Screen {
+        target: Target::Id(TaskId(3)),
+      },
+      RpcRequest::Attach {
+        target: "@dekit/console".parse().unwrap(),
         width: 80,
         height: 24,
       },
-      RpcRequest::Spawn {
-        path: "web".to_string(),
-        cmd: vec!["npm".to_string(), "start".to_string()],
-        cwd: Some("/repo".to_string()),
-        env: None,
-        deps: vec![],
-        tags: vec![],
-      },
-      RpcRequest::Spawn {
-        path: "api".to_string(),
-        cmd: vec!["./api".to_string()],
-        cwd: None,
-        env: Some(IndexMap::from([
-          ("PORT".to_string(), Some("8080".to_string())),
-          ("DEBUG".to_string(), None),
-        ])),
-        deps: vec!["db".to_string()],
-        tags: vec!["backend".to_string()],
-      },
-      RpcRequest::Ls { pattern: None },
-      RpcRequest::Ls {
-        pattern: Some("services/*".to_string()),
-      },
-      RpcRequest::Up { pattern: None },
-      RpcRequest::Up {
-        pattern: Some("web".to_string()),
-      },
-      RpcRequest::Start {
-        pattern: "web".to_string(),
-      },
-      RpcRequest::Stop {
-        pattern: "web".to_string(),
-      },
-      RpcRequest::Down { pattern: None },
-      RpcRequest::Down {
-        pattern: Some("web".to_string()),
-      },
-      RpcRequest::Kill {
-        pattern: "web".to_string(),
-      },
-      RpcRequest::Veto {
-        pattern: "web".to_string(),
-      },
-      RpcRequest::Restart {
-        pattern: "web".to_string(),
-      },
-      RpcRequest::Why {
-        path: "web".to_string(),
-      },
-      RpcRequest::Screen {
-        path: "web".to_string(),
-      },
-      RpcRequest::Shutdown {},
     ]
   }
 
@@ -274,29 +191,20 @@ mod tests {
   #[test]
   fn golden_methods_encode_exactly() {
     let expected = [
-      ("tui_attach", r#"{"height":24,"width":80}"#),
+      ("command", r#"{"command":"start","target":"web"}"#),
       (
-        "spawn",
-        r#"{"cmd":["npm","start"],"cwd":"/repo","path":"web"}"#,
+        "command",
+        r#"{"cmd":["./api"],"command":"add","cwd":"/repo","deps":["db"],"tags":["backend"],"target":"api"}"#,
       ),
-      (
-        "spawn",
-        r#"{"cmd":["./api"],"deps":["db"],"env":{"DEBUG":null,"PORT":"8080"},"path":"api","tags":["backend"]}"#,
-      ),
+      ("command", r#"{"command":"quit"}"#),
       ("ls", r#"null"#),
-      ("ls", r#"{"pattern":"services/*"}"#),
-      ("up", r#"null"#),
-      ("up", r#"{"pattern":"web"}"#),
-      ("start", r#"{"pattern":"web"}"#),
-      ("stop", r#"{"pattern":"web"}"#),
-      ("down", r#"null"#),
-      ("down", r#"{"pattern":"web"}"#),
-      ("kill", r#"{"pattern":"web"}"#),
-      ("veto", r#"{"pattern":"web"}"#),
-      ("restart", r#"{"pattern":"web"}"#),
-      ("why", r#"{"path":"web"}"#),
-      ("screen", r#"{"path":"web"}"#),
-      ("shutdown", r#"null"#),
+      ("ls", r#"{"target":"services/*"}"#),
+      ("why", r#"{"target":"web"}"#),
+      ("screen", r#"{"target":{"id":3}}"#),
+      (
+        "attach",
+        r#"{"height":24,"target":"@dekit/console","width":80}"#,
+      ),
     ];
     let samples = samples();
     assert_eq!(samples.len(), expected.len());
@@ -334,8 +242,14 @@ mod tests {
 
   #[test]
   fn bad_params_are_reported_as_such() {
-    let err = RpcRequest::from_wire("start", serde_json::json!({"pattern": 5}))
+    let err = RpcRequest::from_wire("why", serde_json::json!({"target": 5}))
       .unwrap_err();
+    assert_eq!(err.code, codes::INVALID_PARAMS);
+    let err = RpcRequest::from_wire(
+      "command",
+      serde_json::json!({"command": "start", "target": "*::x"}),
+    )
+    .unwrap_err();
     assert_eq!(err.code, codes::INVALID_PARAMS);
   }
 
@@ -343,25 +257,21 @@ mod tests {
   fn missing_params_object_is_tolerated() {
     assert_eq!(
       RpcRequest::from_wire("ls", Value::Null).unwrap(),
-      RpcRequest::Ls { pattern: None }
-    );
-    assert_eq!(
-      RpcRequest::from_wire("up", Value::Null).unwrap(),
-      RpcRequest::Up { pattern: None }
+      RpcRequest::Ls { target: None }
     );
   }
 
   #[test]
   fn unknown_param_fields_are_ignored() {
     let req = RpcRequest::from_wire(
-      "start",
-      serde_json::json!({"pattern": "x", "future_field": true}),
+      "why",
+      serde_json::json!({"target": "x", "future_field": true}),
     )
     .unwrap();
     assert_eq!(
       req,
-      RpcRequest::Start {
-        pattern: "x".to_string()
+      RpcRequest::Why {
+        target: Target::glob("x")
       }
     );
   }

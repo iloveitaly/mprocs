@@ -38,6 +38,7 @@ impl From<crate::mprocs::config::ProcConfig> for TaskConfig {
   fn from(legacy: crate::mprocs::config::ProcConfig) -> Self {
     TaskConfig {
       path: legacy.name,
+      label: None,
       cmd: Some(legacy.cmd.into()),
       deps: legacy.deps,
       tags: Vec::new(),

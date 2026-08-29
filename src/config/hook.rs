@@ -2,6 +2,7 @@ use anyhow::Result;
 
 use crate::cfg::CfgObj;
 use crate::command::{Command, issue};
+use crate::config::config::Config;
 use crate::console::action::Action;
 use crate::kernel::kernel_message::{TaskContext, TaskSelector, TaskSender};
 
@@ -12,13 +13,9 @@ pub enum Hook {
 }
 
 impl Hook {
-  pub fn run(&self, pc: &TaskContext, console: &TaskSender) {
+  pub fn run(&self, pc: &TaskContext, config: &Config, console: &TaskSender) {
     match self {
-      Hook::Command(command) => {
-        if let Err(err) = issue(pc, command) {
-          log::error!("Hook command failed: {err}");
-        }
-      }
+      Hook::Command(command) => issue(pc, config, command.clone()),
       Hook::LegacyAction(action) => console.send(action.clone()),
     }
   }
@@ -27,16 +24,18 @@ impl Hook {
 /// Runs `hook` each time the selected set goes from active to idle.
 pub fn watch_idle(
   pc: &TaskContext,
+  config: &Config,
   selector: TaskSelector,
   hook: Hook,
   console: TaskSender,
 ) {
   let mut watch = pc.watch_active(selector);
   let pc = pc.clone();
+  let config = config.clone();
   tokio::spawn(async move {
     while let Some(active) = watch.recv().await {
       if !active {
-        hook.run(&pc, &console);
+        hook.run(&pc, &config, &console);
       }
     }
   });

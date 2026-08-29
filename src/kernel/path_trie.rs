@@ -179,20 +179,6 @@ impl PathTrie {
     node.task
   }
 
-  /// List direct children of a path node.
-  /// Returns (component_name, Option<TaskId>) for each child.
-  pub fn children(&self, path: &TaskPath) -> Vec<(String, Option<TaskId>)> {
-    let node = self.walk_to(path);
-    let Some(node) = node else {
-      return Vec::new();
-    };
-    node
-      .children
-      .iter()
-      .map(|(name, child)| (name.clone(), child.task))
-      .collect()
-  }
-
   /// Recursively collect all tasks under a prefix path.
   pub fn descendants(&self, path: &TaskPath) -> Vec<(TaskPath, TaskId)> {
     let node = self.walk_to(path);
@@ -217,13 +203,6 @@ impl PathTrie {
     // A path can match through several `**` derivations.
     result.sort();
     result.dedup();
-    result
-  }
-
-  /// Iterate all (path, task_id) pairs in sorted order (DFS over BTreeMap).
-  pub fn iter(&self) -> Vec<(TaskPath, TaskId)> {
-    let mut result = Vec::new();
-    self.root.collect_all("", &mut result);
     result
   }
 
@@ -289,27 +268,6 @@ mod tests {
   }
 
   #[test]
-  fn test_children() {
-    let mut trie = PathTrie::new();
-    trie.insert(&path("services/api"), TaskId(1)).unwrap();
-    trie.insert(&path("services/web"), TaskId(2)).unwrap();
-    trie.insert(&path("services/web/v2"), TaskId(3)).unwrap();
-    trie.insert(&path("tools/lint"), TaskId(4)).unwrap();
-
-    let root_children = trie.children(&TaskPath::root());
-    assert_eq!(root_children.len(), 2); // services, tools
-    assert_eq!(root_children[0].0, "services");
-    assert_eq!(root_children[0].1, None); // intermediate
-    assert_eq!(root_children[1].0, "tools");
-    assert_eq!(root_children[1].1, None);
-
-    let svc_children = trie.children(&path("services"));
-    assert_eq!(svc_children.len(), 2); // api, web
-    assert_eq!(svc_children[0], ("api".to_string(), Some(TaskId(1))));
-    assert_eq!(svc_children[1], ("web".to_string(), Some(TaskId(2))));
-  }
-
-  #[test]
   fn test_descendants() {
     let mut trie = PathTrie::new();
     trie.insert(&path("services/api"), TaskId(1)).unwrap();
@@ -368,18 +326,5 @@ mod tests {
     assert_eq!(results.len(), 2);
     assert_eq!(results[0], (path("a/b/c"), TaskId(1)));
     assert_eq!(results[1], (path("a/x/c"), TaskId(2)));
-  }
-
-  #[test]
-  fn test_iter_sorted() {
-    let mut trie = PathTrie::new();
-    trie.insert(&path("z"), TaskId(1)).unwrap();
-    trie.insert(&path("a/b"), TaskId(2)).unwrap();
-    trie.insert(&path("a/a"), TaskId(3)).unwrap();
-    trie.insert(&path("m"), TaskId(4)).unwrap();
-
-    let items = trie.iter();
-    let paths: Vec<&str> = items.iter().map(|(p, _)| p.as_str()).collect();
-    assert_eq!(paths, vec!["a/a", "a/b", "m", "z"]);
   }
 }

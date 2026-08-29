@@ -5,29 +5,35 @@ use crate::protocol::{
   ConnReceiver, ConnSender, CtlMsg, Event, Msg, Request, RpcRequest,
   client_handshake, codes, ctl::EVENT_INPUT,
 };
+use crate::target::Target;
 use crate::term::TermEvent;
 use crate::term::key::{Key, KeyEventKind};
 use crate::term_driver::TermDriver;
 
+/// Attaches the local terminal to `target`'s screen until the session
+/// ends.
 pub async fn client_main(
+  target: Target,
   mut sender: ConnSender,
   mut receiver: ConnReceiver,
 ) -> anyhow::Result<()> {
   client_handshake(&mut sender, &mut receiver).await?;
 
   let mut term_driver = TermDriver::create()?;
-  let result = client_loop(&mut term_driver, sender, receiver).await;
+  let result = client_loop(&mut term_driver, target, sender, receiver).await;
   drop(term_driver);
   result
 }
 
 async fn client_loop(
   term_driver: &mut TermDriver,
+  target: Target,
   mut sender: ConnSender,
   mut receiver: ConnReceiver,
 ) -> anyhow::Result<()> {
   let size = term_driver.size()?;
-  let (method, params) = RpcRequest::TuiAttach {
+  let (method, params) = RpcRequest::Attach {
+    target,
     width: size.width,
     height: size.height,
   }
@@ -62,7 +68,7 @@ async fn client_loop(
         Some(Ok(Msg::Ctl(msg))) => match msg {
           CtlMsg::Response(response) => {
             if let Some(error) = response.error {
-              bail!("tui_attach failed: {error}");
+              bail!("attach failed: {error}");
             }
           }
           CtlMsg::Bye(bye) => {

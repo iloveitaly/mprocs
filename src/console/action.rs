@@ -2,12 +2,14 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::console::client::ClientId;
-use crate::kernel::task::TaskId;
+use crate::command::Command;
 use crate::term::key::{Key, key_spec};
 
+/// The built-in console's own messages: view state, modals, and verbs on
+/// the current task. Keymap config spells them `{action: ..., ...}`, or
+/// a bare name for argument-less ones.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(tag = "c", rename_all = "kebab-case")]
+#[serde(tag = "action", rename_all = "kebab-case")]
 pub enum Action {
   Batch {
     cmds: Vec<Action>,
@@ -16,8 +18,9 @@ pub enum Action {
   QuitOrAsk,
   Quit,
   ForceQuit,
-  Detach {
-    client_id: ClientId,
+  /// Execute a kernel command as-is.
+  Command {
+    command: Command,
   },
 
   ToggleFocus,
@@ -50,20 +53,19 @@ pub enum Action {
   },
   DuplicateTask,
   ShowRemoveTask,
-  RemoveTask {
-    id: TaskId,
-  },
 
   CloseCurrentModal,
 
   ScrollUp {
     #[serde(default = "default_scroll_n")]
     n: usize,
+    #[serde(default = "default_scroll_unit")]
     unit: ScrollUnit,
   },
   ScrollDown {
     #[serde(default = "default_scroll_n")]
     n: usize,
+    #[serde(default = "default_scroll_unit")]
     unit: ScrollUnit,
   },
 
@@ -86,7 +88,7 @@ impl Action {
   /// The serde tag, e.g. `start-task`.
   pub fn name(&self) -> String {
     match serde_json::to_value(self) {
-      Ok(serde_json::Value::Object(map)) => match map.get("c") {
+      Ok(serde_json::Value::Object(map)) => match map.get("action") {
         Some(serde_json::Value::String(name)) => name.clone(),
         _ => String::new(),
       },
@@ -100,9 +102,7 @@ impl Action {
       Action::QuitOrAsk => "Quit".to_string(),
       Action::Quit => "Quit".to_string(),
       Action::ForceQuit => "Force quit".to_string(),
-      Action::Detach { client_id } => {
-        format!("Detach client #{:?}", client_id)
-      }
+      Action::Command { command } => format!("Run {:?}", command),
       Action::ToggleFocus => "Toggle focus".to_string(),
       Action::FocusTasks => "Focus task list".to_string(),
       Action::FocusTerm => "Focus terminal".to_string(),
@@ -125,7 +125,6 @@ impl Action {
       Action::AddTask { cmd, name: _ } => format!("New task `{}`", cmd),
       Action::DuplicateTask => "Duplicate current task".to_string(),
       Action::ShowRemoveTask => "Remove task dialog".to_string(),
-      Action::RemoveTask { id } => format!("Remove task by id {}", id.0),
       Action::CloseCurrentModal => "Close current modal".to_string(),
       Action::ScrollUp { n, unit } => scroll_desc("up", *n, *unit),
       Action::ScrollDown { n, unit } => scroll_desc("down", *n, *unit),
@@ -150,6 +149,10 @@ fn default_scroll_n() -> usize {
   1
 }
 
+fn default_scroll_unit() -> ScrollUnit {
+  ScrollUnit::HalfScreen
+}
+
 fn scroll_desc(dir: &str, n: usize, unit: ScrollUnit) -> String {
   match unit {
     ScrollUnit::Line => format!("Scroll {} {} {}", dir, n, lines_str(n)),
@@ -172,8 +175,7 @@ mod tests {
 
   #[test]
   fn deserialize_scroll() {
-    let a: Action =
-      serde_yaml::from_str("c: scroll-up\nunit: half-screen\n").unwrap();
+    let a: Action = serde_yaml::from_str("action: scroll-up\n").unwrap();
     assert_eq!(
       a,
       Action::ScrollUp {
@@ -183,7 +185,7 @@ mod tests {
     );
 
     let a: Action =
-      serde_yaml::from_str("c: scroll-down\nn: 3\nunit: line\n").unwrap();
+      serde_yaml::from_str("action: scroll-down\nn: 3\nunit: line\n").unwrap();
     assert_eq!(
       a,
       Action::ScrollDown {

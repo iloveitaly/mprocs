@@ -4,28 +4,25 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::error::ResultLogger;
 use crate::kernel::kernel_message::{
-  KernelCommand, SharedVt, TaskContext, TaskRegistration,
+  KernelCommand, SharedVt, TaskContext, TaskRegistration, TaskSelector,
 };
 use crate::kernel::task::{
   ExitInfo, ReadyMode, RestartMode, TaskCmd, TaskDef, TaskId,
 };
+use crate::kernel::task_key::TaskKey;
 use crate::kernel::task_path::TaskPath;
-use crate::kernel::task_screen::{TaskScreen, TaskScreenCmd, TaskScreenEffect};
+use crate::kernel::task_screen::{
+  DEFAULT_SIZE, TaskScreen, TaskScreenCmd, TaskScreenEffect,
+};
 use crate::process::NativeProcess;
 use crate::process::process::Process as _;
 use crate::process::process_spec::ProcessSpec;
 use crate::task::logger::{LogResolver, spawn_logger};
 use crate::term::key::Key;
 use crate::term::vt::emit::{self, KeyEncodeModes};
-use crate::term::{Screen, Size, Winsize};
+use crate::term::{Screen, Winsize};
 
 struct ProcExited(ExitInfo);
-
-pub struct ProcessInput(pub Key);
-
-pub struct ProcessPaste(pub String);
-
-pub struct DuplicateTask(pub Option<String>);
 
 /// An OS signal a `Signal` stop can deliver. The name table and the libc
 /// mapping are generated from one list so they can't drift. On Windows only
@@ -139,109 +136,44 @@ pub struct ProcessTaskConfig {
   pub ready_log: Option<String>,
   pub scrollback_len: usize,
   pub mouse_scroll_speed: usize,
-  pub deps: Vec<TaskId>,
+  pub deps: Vec<TaskSelector>,
   pub tags: Vec<String>,
   /// Pin to init at registration, so a registered task is already
   /// started with no separate `Start` command.
   pub pinned: bool,
 }
 
-impl ProcessTaskConfig {
-  pub fn new(spec: ProcessSpec) -> Self {
-    Self {
-      spec,
-      label: None,
-      stop: StopSignal::default(),
-      log: None,
-      restart: RestartMode::Never,
-      ready_log: None,
-      scrollback_len: 1000,
-      mouse_scroll_speed: 5,
-      deps: Vec::new(),
-      tags: Vec::new(),
-      pinned: false,
-    }
-  }
-}
-
-pub fn spawn_process_task(
-  parent: &TaskContext,
-  task_path: Option<TaskPath>,
-  config: ProcessTaskConfig,
-) -> (TaskId, tokio::sync::oneshot::Receiver<bool>) {
-  let task_id = parent.alloc_id();
-  let ack = spawn_process_task_with_id(parent, task_id, task_path, config);
-  (task_id, ack)
-}
-
-pub fn spawn_process_task_with_id(
-  parent: &TaskContext,
-  task_id: TaskId,
-  task_path: Option<TaskPath>,
-  config: ProcessTaskConfig,
-) -> tokio::sync::oneshot::Receiver<bool> {
-  let registration = process_task_registration(task_id, task_path, config);
-  parent.register_task(registration)
-}
-
 pub fn process_task_registration(
   task_id: TaskId,
-  task_path: Option<TaskPath>,
+  key: Option<TaskKey>,
   config: ProcessTaskConfig,
 ) -> TaskRegistration {
-  let ProcessTaskConfig {
-    spec,
-    stop,
-    log,
-    restart,
-    ready_log,
-    scrollback_len,
-    mouse_scroll_speed,
-    deps,
-    label,
-    tags,
-    pinned,
-  } = config;
-  let vt = SharedVt::new(Screen::new(
-    Size {
-      height: 24,
-      width: 80,
-    },
-    scrollback_len,
-  ));
+  let vt = SharedVt::new(Screen::new(DEFAULT_SIZE, config.scrollback_len));
   let task_vt = vt.clone();
-  let ready = match ready_log {
-    Some(_) => ReadyMode::Reported,
-    None => ReadyMode::Immediate,
+  let (space, path) = match key.clone() {
+    Some(key) => (key.space, Some(key.path)),
+    None => (Default::default(), None),
   };
+  let mut config = config;
   TaskRegistration::async_task(
     task_id,
     TaskDef {
-      ready,
-      restart,
-      deps,
-      path: task_path.clone(),
-      label,
+      ready: match config.ready_log {
+        Some(_) => ReadyMode::Reported,
+        None => ReadyMode::Immediate,
+      },
+      restart: config.restart,
+      deps: std::mem::take(&mut config.deps),
+      space,
+      path,
+      label: config.label.take(),
       vt: Some(vt),
-      tags,
-      pinned,
+      tags: std::mem::take(&mut config.tags),
+      pinned: config.pinned,
       ..Default::default()
     },
     move |ctx, receiver| async move {
-      process_main(
-        ctx,
-        receiver,
-        task_path,
-        spec,
-        task_vt,
-        log,
-        stop,
-        scrollback_len,
-        mouse_scroll_speed,
-        restart,
-        ready_log,
-      )
-      .await;
+      process_main(ctx, receiver, key, task_vt, config).await;
     },
   )
 }
@@ -249,17 +181,12 @@ pub fn process_task_registration(
 async fn process_main(
   ctx: TaskContext,
   mut receiver: UnboundedReceiver<TaskCmd>,
-  task_path: Option<TaskPath>,
-  spec: ProcessSpec,
+  key: Option<TaskKey>,
   vt: SharedVt,
-  mut log: Option<LogResolver>,
-  stop: StopSignal,
-  scrollback_len: usize,
-  mouse_scroll_speed: usize,
-  restart: RestartMode,
-  ready_log: Option<String>,
+  mut config: ProcessTaskConfig,
 ) {
-  let mut task_screen = TaskScreen::new(ctx.task_id, vt, mouse_scroll_speed);
+  let mut task_screen =
+    TaskScreen::new(ctx.task_id, vt, config.mouse_scroll_speed);
   let mut screen_effects: Vec<TaskScreenEffect> = Vec::new();
 
   let mut process: Option<NativeProcess> = None;
@@ -300,7 +227,7 @@ async fn process_main(
       Next::Cmd(Some(cmd)) => match cmd {
         TaskCmd::Start => {
           if process.is_none() {
-            process = start_instance(&ctx, &spec, task_screen.vt());
+            process = start_instance(&ctx, &config.spec, task_screen.vt());
             if let Some(p) = &process {
               exit_info = None;
               stdout_eof = false;
@@ -308,7 +235,7 @@ async fn process_main(
               ready_sent = false;
               update_log_observer(
                 &mut task_screen,
-                &mut log,
+                &mut config.log,
                 &mut current_log,
                 p.pid(),
               );
@@ -317,13 +244,46 @@ async fn process_main(
         }
         TaskCmd::Stop => {
           if let Some(p) = process.as_mut() {
-            stop_process(p, &stop, task_screen.vt(), &spec).await;
+            stop_process(p, &config.stop, task_screen.vt(), &config.spec).await;
           }
         }
         TaskCmd::Kill => {
           if let Some(p) = process.as_mut() {
-            p.kill(stop.kill_group()).await.log_ignore();
+            p.kill(config.stop.kill_group()).await.log_ignore();
           }
+        }
+        TaskCmd::Duplicate(label) => {
+          let new_id = ctx.alloc_id();
+          let key = match &key {
+            Some(k) => TaskPath::new(format!("{}_{}", k.path, new_id.0))
+              .ok()
+              .map(|path| TaskKey::new(k.space.clone(), path)),
+            None => TaskPath::new(new_id.0.to_string())
+              .ok()
+              .map(TaskKey::default_space),
+          };
+          let ack = ctx.register_task(process_task_registration(
+            new_id,
+            key,
+            ProcessTaskConfig {
+              spec: config.spec.clone(),
+              stop: config.stop.clone(),
+              log: None,
+              restart: config.restart,
+              ready_log: config.ready_log.clone(),
+              scrollback_len: config.scrollback_len,
+              mouse_scroll_speed: config.mouse_scroll_speed,
+              deps: Vec::new(),
+              label,
+              tags: Vec::new(),
+              pinned: true,
+            },
+          ));
+          tokio::spawn(async move {
+            if let Ok(Err(err)) = ack.await {
+              log::warn!("Duplicate failed: {err}");
+            }
+          });
         }
         TaskCmd::Msg(msg) => {
           let msg = match msg.downcast::<ProcExited>() {
@@ -336,82 +296,25 @@ async fn process_main(
             }
             Err(msg) => msg,
           };
-          let msg = match msg.downcast::<TaskScreenCmd>() {
+          match msg.downcast::<TaskScreenCmd>() {
             Ok(cmd) => {
               task_screen.handle_cmd(*cmd, &mut screen_effects);
               apply_effects(
                 &mut screen_effects,
                 &mut process,
                 task_screen.vt(),
+                &mut key_buf,
               )
               .await;
-              continue;
             }
-            Err(msg) => msg,
-          };
-          let msg = match msg.downcast::<ProcessInput>() {
-            Ok(input) => {
-              if let Some(p) = process.as_mut() {
-                send_key(p, task_screen.vt(), input.0, &mut key_buf).await;
-              }
-              continue;
-            }
-            Err(msg) => msg,
-          };
-          let msg = match msg.downcast::<ProcessPaste>() {
-            Ok(paste) => {
-              if let Some(p) = process.as_mut() {
-                let bracketed = task_screen
-                  .vt()
-                  .read()
-                  .map(|screen| screen.bracketed_paste())
-                  .unwrap_or(false);
-                key_buf.clear();
-                emit::paste(&mut key_buf, &paste.0, bracketed);
-                p.write_all(&key_buf).await.log_ignore();
-              }
-              continue;
-            }
-            Err(msg) => msg,
-          };
-          let msg = match msg.downcast::<DuplicateTask>() {
-            Ok(dup) => {
-              let new_id = ctx.alloc_id();
-              let path = match &task_path {
-                Some(p) => TaskPath::new(format!("{}_{}", p, new_id.0)),
-                None => TaskPath::new(new_id.0.to_string()),
-              }
-              .ok();
-              let _ = spawn_process_task_with_id(
-                &ctx,
-                new_id,
-                path,
-                ProcessTaskConfig {
-                  spec: spec.clone(),
-                  stop: stop.clone(),
-                  log: None,
-                  restart,
-                  ready_log: ready_log.clone(),
-                  scrollback_len,
-                  mouse_scroll_speed,
-                  deps: Vec::new(),
-                  label: dup.0,
-                  tags: Vec::new(),
-                  pinned: true,
-                },
-              );
-              continue;
-            }
-            Err(msg) => msg,
-          };
-          let _ = msg;
-          log::error!("ProcessTask received unknown Msg");
+            Err(_) => log::error!("ProcessTask received unknown Msg"),
+          }
         }
       },
 
       Next::Read(Ok(0)) => stdout_eof = true,
       Next::Read(Ok(n)) => {
-        if let Some(pattern) = &ready_log
+        if let Some(pattern) = &config.ready_log
           && !ready_sent
         {
           ready_sent =
@@ -420,8 +323,13 @@ async fn process_main(
         task_screen
           .process(&read_buf[..n], &mut screen_effects)
           .await;
-        apply_effects(&mut screen_effects, &mut process, task_screen.vt())
-          .await;
+        apply_effects(
+          &mut screen_effects,
+          &mut process,
+          task_screen.vt(),
+          &mut key_buf,
+        )
+        .await;
       }
       Next::Read(Err(e)) => {
         log::warn!("Process read error: {}", e);
@@ -471,10 +379,10 @@ fn update_log_observer(
     }
   }
   if let Some((_, id)) = current.take() {
-    task_screen.remove_direct_observer(id);
+    task_screen.remove_logger(id);
   }
   let path = sink.path.clone();
-  let id = task_screen.add_direct_observer(spawn_logger(sink));
+  let id = task_screen.add_logger(spawn_logger(sink));
   *current = Some((path, id));
 }
 
@@ -521,6 +429,7 @@ async fn apply_effects(
   effects: &mut Vec<TaskScreenEffect>,
   process: &mut Option<NativeProcess>,
   vt: &SharedVt,
+  key_buf: &mut Vec<u8>,
 ) {
   for effect in effects.drain(..) {
     match effect {
@@ -529,10 +438,23 @@ async fn apply_effects(
           p.write_all(&s).await.log_ignore();
         }
       }
-      TaskScreenEffect::Resize(size) => {
-        if let Ok(mut screen) = vt.write() {
-          screen.set_size(size.y, size.x);
+      TaskScreenEffect::Key(key) => {
+        if let Some(p) = process.as_mut() {
+          send_key(p, vt, key, key_buf).await;
         }
+      }
+      TaskScreenEffect::Paste(text) => {
+        if let Some(p) = process.as_mut() {
+          let bracketed = vt
+            .read()
+            .map(|screen| screen.bracketed_paste())
+            .unwrap_or(false);
+          key_buf.clear();
+          emit::paste(key_buf, &text, bracketed);
+          p.write_all(key_buf).await.log_ignore();
+        }
+      }
+      TaskScreenEffect::Resize(size) => {
         if let Some(p) = process.as_mut() {
           p.resize(size).log_ignore();
         }
@@ -551,12 +473,7 @@ async fn send_key(
   // "disambiguate escape codes" flag.
   let (csi_u, application_cursor_keys) = vt
     .read()
-    .map(|s| {
-      (
-        s.kitty_flags() != 0,
-        s.application_cursor(),
-      )
-    })
+    .map(|s| (s.kitty_flags() != 0, s.application_cursor()))
     .unwrap_or((false, false));
   let modes = KeyEncodeModes {
     enable_csi_u_key_encoding: csi_u,
@@ -669,19 +586,53 @@ mod tests {
 
   use crate::kernel::kernel::Kernel;
   use crate::kernel::kernel_message::{
-    KernelCommand, KernelQuery, KernelQueryResponse, TaskContext, TaskSelector,
+    KernelCommand, KernelQuery, KernelQueryResponse, SpaceSelector, TaskContext,
   };
   use crate::kernel::task::TaskId;
-  use crate::kernel::task_key::TaskKey;
   use crate::task::logger::LogSink;
 
   use super::*;
 
+  impl ProcessTaskConfig {
+    pub fn new(spec: ProcessSpec) -> Self {
+      Self {
+        spec,
+        label: None,
+        stop: StopSignal::default(),
+        log: None,
+        restart: RestartMode::Never,
+        ready_log: None,
+        scrollback_len: 1000,
+        mouse_scroll_speed: 5,
+        deps: Vec::new(),
+        tags: Vec::new(),
+        pinned: false,
+      }
+    }
+  }
+
+  fn spawn_process_task(
+    parent: &TaskContext,
+    key: Option<TaskKey>,
+    config: ProcessTaskConfig,
+  ) -> (
+    TaskId,
+    tokio::sync::oneshot::Receiver<
+      Result<(), crate::kernel::kernel_message::RegisterError>,
+    >,
+  ) {
+    let task_id = parent.alloc_id();
+    let ack =
+      parent.register_task(process_task_registration(task_id, key, config));
+    (task_id, ack)
+  }
+
   async fn resolve(pc: &TaskContext, path: &str) -> TaskId {
     let (tx, rx) = tokio::sync::oneshot::channel();
     pc.send(KernelCommand::Query(
-      KernelQuery::ResolvePath(TaskKey::default_space(
-        TaskPath::new(path).unwrap(),
+      KernelQuery::ListTasks(TaskSelector::Glob(
+        SpaceSelector::default_space(),
+        path.to_string(),
       )),
       tx,
     ));
@@ -690,7 +641,7 @@ mod tests {
       .expect("timed out resolving path")
       .expect("kernel query channel closed");
     match resp {
-      KernelQueryResponse::ResolvedPath(Some(id)) => id,
+      KernelQueryResponse::TaskList(tasks) if tasks.len() == 1 => tasks[0].id,
       _ => panic!("path did not resolve: {path}"),
     }
   }
@@ -707,7 +658,7 @@ mod tests {
     let kernel = Kernel::new();
     let pc = kernel.context();
 
-    let path = TaskPath::new("logged").unwrap();
+    let path = TaskKey::default_space(TaskPath::new("logged").unwrap());
     let spec = ProcessSpec::from_argv(vec![
       "sh".to_string(),
       "-c".to_string(),
@@ -745,7 +696,7 @@ mod tests {
     // The SIGCHLD waiter isn't running in unit tests, so the task never
     // transitions to Exited on its own; remove it explicitly to unblock quit.
     let id = resolve(&pc, "logged").await;
-    pc.send(KernelCommand::RemoveTask(id));
+    pc.send(KernelCommand::Remove(TaskSelector::Id(id), None));
     pc.send(KernelCommand::Quit);
     tokio::time::timeout(Duration::from_secs(2), kernel_task)
       .await
@@ -780,7 +731,7 @@ mod tests {
     let log_dir = dir.clone();
     let (id, _) = spawn_process_task(
       &pc,
-      Some(TaskPath::new("pidlog").unwrap()),
+      Some(TaskKey::default_space(TaskPath::new("pidlog").unwrap())),
       ProcessTaskConfig {
         log: Some(Box::new(move |pid| {
           *cap.lock().unwrap() = Some(pid);
@@ -810,7 +761,7 @@ mod tests {
     assert_ne!(pid, 0, "resolver should receive a real pid");
 
     let id = resolve(&pc, "pidlog").await;
-    pc.send(KernelCommand::RemoveTask(id));
+    pc.send(KernelCommand::Remove(TaskSelector::Id(id), None));
     pc.send(KernelCommand::Quit);
     tokio::time::timeout(Duration::from_secs(2), kernel_task)
       .await
@@ -832,7 +783,7 @@ mod tests {
     let kernel = Kernel::new();
     let pc = kernel.context();
 
-    let path = TaskPath::new("sleeper").unwrap();
+    let path = TaskKey::default_space(TaskPath::new("sleeper").unwrap());
     let spec = ProcessSpec::from_argv(vec![
       "sh".to_string(),
       "-c".to_string(),
@@ -863,7 +814,7 @@ mod tests {
     }
 
     pc.send(KernelCommand::Kill(TaskSelector::Id(id), None));
-    pc.send(KernelCommand::RemoveTask(id));
+    pc.send(KernelCommand::Remove(TaskSelector::Id(id), None));
     pc.send(KernelCommand::Quit);
     tokio::time::timeout(Duration::from_secs(2), kernel_task)
       .await

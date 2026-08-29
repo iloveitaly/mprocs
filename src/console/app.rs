@@ -1,17 +1,16 @@
-use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
+use std::sync::Arc;
+
+use tokio::sync::mpsc::{
+  UnboundedReceiver, UnboundedSender, unbounded_channel,
+};
 
 use crate::{
-  command::{Command, Target, issue},
-  config::{
-    config::Config,
-    task::{CmdConfig, TaskConfig},
-  },
+  command::{Command, issue},
+  config::{config::Config, task::CmdConfig},
   console::{
     action::{Action, CopyMove, ScrollUnit},
     app_layout::AppLayout,
-    client::ClientHandle,
-    client::{ClientEvent, ClientId},
-    keymap::Keymap,
+    keymap::{Keymap, KeymapGroup},
     modal::{
       add_task::AddTaskModal,
       commands_menu::CommandsMenuModal,
@@ -28,28 +27,24 @@ use crate::{
     ui_zoom_tip::render_zoom_tip,
     widgets::list::ListState,
   },
-  error::ResultLogger,
   kernel::{
     copy_mode::CopyMove as KernelCopyMove,
     kernel_message::{KernelCommand, SharedVt, TaskContext, TaskRegistration},
     sub_trie::SubMode,
     task::{
-      ChannelTask, TaskCmd, TaskDef, TaskId, TaskNotification, TaskNotify,
-      TaskState,
+      ChannelTask, ExitInfo, TaskCmd, TaskDef, TaskId, TaskNotification,
+      TaskNotify, TaskState,
     },
-    task_key::{TaskKey, TaskSpaceId},
-    task_path::TaskPath,
+    task_key::TaskKey,
+    task_path::{TaskPath, is_valid_component_char},
     task_screen::{
-      FramedScreenNotify, ScrollUnit as KernelScrollUnit, TaskScreenCmd,
+      DEFAULT_SIZE, ObserverId, ScreenNotify, ScrollUnit as KernelScrollUnit,
+      TaskScreen, TaskScreenCmd, TaskScreenEffect,
     },
   },
-  protocol::{Bye, CtlMsg, codes},
-  task::{
-    config_tasks::{spawn_config_task, unique_task_name},
-    process_task::{DuplicateTask, ProcessInput, ProcessPaste},
-  },
+  target::Target,
   term::{
-    CursorStyle, Grid, Size, TermEvent, Winsize,
+    CursorStyle, Screen, Size, TermEvent, Winsize,
     attrs::Attrs,
     grid::Rect,
     key::{Key, KeyEventKind},
@@ -74,6 +69,31 @@ fn kernel_scroll_unit(unit: ScrollUnit) -> KernelScrollUnit {
   }
 }
 
+/// A task path component made from free text such as a shell command.
+fn path_name(text: &str) -> String {
+  let name: String = text
+    .chars()
+    .map(|c| if is_valid_component_char(c) { c } else { '-' })
+    .collect();
+  let name = name.trim_matches('-').to_string();
+  if name.is_empty() {
+    "task".to_string()
+  } else {
+    name
+  }
+}
+
+/// `base`, or `base-2`, `base-3`, ... — the first that is not `taken`.
+fn unique(base: &str, taken: impl Fn(&str) -> bool) -> String {
+  if !taken(base) {
+    return base.to_string();
+  }
+  (2..)
+    .map(|n| format!("{}-{}", base, n))
+    .find(|name| !taken(name))
+    .unwrap()
+}
+
 fn winsize(size: Size) -> Winsize {
   Winsize {
     x: size.width,
@@ -83,17 +103,19 @@ fn winsize(size: Size) -> Winsize {
   }
 }
 
-/// The receiver resolves once the console has said goodbye to its clients.
 pub fn console_task_registration(
   task_id: TaskId,
   def: TaskDef,
-  config: Config,
+  config: Arc<Config>,
   keymap: Keymap,
-) -> (TaskRegistration, oneshot::Receiver<()>) {
-  let (done, done_rx) = oneshot::channel();
-  let registration = TaskRegistration {
+) -> TaskRegistration {
+  let vt = SharedVt::new(Screen::new(DEFAULT_SIZE, 0));
+  TaskRegistration {
     task_id,
-    def,
+    def: TaskDef {
+      vt: Some(vt.clone()),
+      ..def
+    },
     factory: Box::new(move |pc| {
       log::debug!("Creating console task (id: {})", pc.task_id.0);
       // Subscribe at registration, so tasks registered later are seen
@@ -102,41 +124,46 @@ pub fn console_task_registration(
         TaskKey::default_space(TaskPath::root()),
         SubMode::Subtree,
       );
-      let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-      tokio::spawn(async move {
-        App::new(config, keymap, rx, pc).run().await;
-        let _ = done.send(());
-      });
+      let (tx, rx) = unbounded_channel();
+      tokio::spawn(App::new(config, keymap, rx, pc, vt).run());
       Box::new(ChannelTask::new(tx))
     }),
-  };
-  (registration, done_rx)
+  }
 }
 
+/// The built-in console: one view state shared by every attachment, drawn
+/// into its own task screen. It observes the screens of the tasks it
+/// shows only while something is attached to it.
 pub struct App {
-  config: Config,
+  config: Arc<Config>,
   keymap: Keymap,
   state: State,
-  grid: Grid,
   modal: Option<Box<dyn Modal>>,
   receiver: UnboundedReceiver<TaskCmd>,
   pc: TaskContext,
-  clients: Vec<ClientHandle>,
+
+  vt: SharedVt,
+  screen: TaskScreen,
+  effects: Vec<TaskScreenEffect>,
+
+  /// The console's identity as an observer of task screens, and where
+  /// their notifications arrive.
+  observer: ObserverId,
+  sink: UnboundedSender<ScreenNotify>,
+  notifies: UnboundedReceiver<ScreenNotify>,
+
   stop: bool,
 }
 
 impl App {
   fn new(
-    config: Config,
+    config: Arc<Config>,
     keymap: Keymap,
     receiver: UnboundedReceiver<TaskCmd>,
     pc: TaskContext,
+    vt: SharedVt,
   ) -> Self {
-    let size = Size {
-      width: 160,
-      height: 50,
-    };
-    let grid = Grid::new(size, 0);
+    let (sink, notifies) = unbounded_channel();
     App {
       state: State {
         scope: Scope::Tasks,
@@ -147,18 +174,23 @@ impl App {
       },
       config,
       keymap,
-      grid,
       modal: None,
       receiver,
+      screen: TaskScreen::new(pc.task_id, vt.clone(), 1),
       pc,
-      clients: Vec::new(),
+      vt,
+      effects: Vec::new(),
+      observer: ObserverId::new(),
+      sink,
+      notifies,
       stop: false,
     }
   }
 
   async fn run(mut self) {
     let mut term_size = self.layout().term_area().size();
-    let mut batch = Vec::new();
+    let mut cmds = Vec::new();
+    let mut notifies = Vec::new();
     while !self.stop {
       let size = self.layout().term_area().size();
       if size != term_size {
@@ -166,46 +198,48 @@ impl App {
         for task in &self.state.tasks {
           self.pc.send_msg(
             task.id,
-            TaskScreenCmd::Resize {
-              size: winsize(size),
-              observer_id: self.pc.task_id,
+            TaskScreenCmd::Input {
+              observer: self.observer,
+              event: TermEvent::Resize(size.width, size.height),
             },
           );
         }
       }
 
-      // Zero means the kernel is gone.
-      if self.receiver.recv_many(&mut batch, 512).await == 0 {
-        break;
-      }
-      for cmd in batch.drain(..) {
-        self.handle_task_cmd(cmd);
+      tokio::select! {
+        n = self.receiver.recv_many(&mut cmds, 512) => {
+          // Zero means the kernel is gone.
+          if n == 0 {
+            break;
+          }
+          for cmd in cmds.drain(..) {
+            self.handle_task_cmd(cmd);
+          }
+        }
+        _ = self.notifies.recv_many(&mut notifies, 512) => {
+          for notify in notifies.drain(..) {
+            self.handle_screen_notify(notify);
+          }
+        }
       }
 
-      if !self.clients.is_empty() {
-        self.render().await;
+      if self.screen.has_observers() {
+        self.render();
       }
-    }
-
-    for client in &mut self.clients {
-      let bye = Bye {
-        code: codes::QUIT.to_string(),
-        message: String::new(),
-      };
-      client.sender.send_ctl(CtlMsg::Bye(bye)).await.log_ignore();
-    }
-    if !self.clients.is_empty() {
-      self.unobserve_all();
     }
     self.pc.unsubscribe_path(
       TaskKey::default_space(TaskPath::root()),
       SubMode::Subtree,
     );
+    self.pc.send(KernelCommand::TaskStopped(ExitInfo::code(0)));
   }
 
-  async fn render(&mut self) {
+  fn render(&mut self) {
     let layout = self.layout();
-    let grid = &mut self.grid;
+    let Ok(mut vt) = self.vt.write() else {
+      return;
+    };
+    let grid = vt.grid_mut();
     grid.erase_all(Attrs::default());
     grid.cursor_pos = None;
     grid.cursor_style = CursorStyle::Default;
@@ -220,32 +254,27 @@ impl App {
       modal.render(grid, &self.keymap);
     }
 
-    for client in &mut self.clients {
-      let mut out = Vec::new();
-      client.differ.diff(&mut out, grid);
-      client.sender.send_out(out.into()).await.log_ignore();
+    match grid.cursor_pos {
+      Some(pos) => {
+        grid.set_pos(pos);
+        vt.set_hide_cursor(false);
+      }
+      None => vt.set_hide_cursor(true),
     }
+    drop(vt);
+    let attached = self.screen.has_observers();
+    self.screen.rendered(&mut self.effects);
+    self.apply_screen(attached);
   }
 
   fn layout(&self) -> AppLayout {
-    let size = self.grid.size();
+    let size = self.vt.read().map(|vt| vt.size()).unwrap_or(DEFAULT_SIZE);
     AppLayout::new(
       Rect::new(0, 0, size.width, size.height),
       self.state.scope.is_zoomed(),
       self.state.hide_keymap_window,
       &self.config,
     )
-  }
-
-  /// The grid fits the smallest client.
-  fn fit_grid(&mut self) {
-    let size = self.clients.iter().map(|c| c.size).reduce(|a, b| Size {
-      width: a.width.min(b.width),
-      height: a.height.min(b.height),
-    });
-    if let Some(size) = size {
-      self.grid.set_size(size);
-    }
   }
 
   fn add_task(
@@ -267,19 +296,18 @@ impl App {
       vt,
       present: None,
     });
-    if !self.clients.is_empty() {
+    if self.screen.has_observers() {
       self.observe(id);
     }
   }
 
-  // Screens are observed only while someone is attached, so an idle
-  // server does not process every task's output.
   fn observe(&self, id: TaskId) {
     self.pc.send_msg(
       id,
-      TaskScreenCmd::Observe {
+      TaskScreenCmd::Attach {
+        observer: self.observer,
         size: winsize(self.layout().term_area().size()),
-        sender: self.pc.get_task_sender(self.pc.task_id),
+        sink: self.sink.clone(),
       },
     );
   }
@@ -295,40 +323,33 @@ impl App {
       task.present = None;
       self.pc.send_msg(
         task.id,
-        TaskScreenCmd::Unobserve {
-          observer_id: self.pc.task_id,
+        TaskScreenCmd::Detach {
+          observer: self.observer,
         },
       );
     }
   }
 
-  fn remove_client(&mut self, client_id: ClientId) {
-    self.clients.retain(|c| c.id != client_id);
-    if self.clients.is_empty() {
-      self.unobserve_all();
-    }
-    self.fit_grid();
-  }
-
   fn handle_task_cmd(&mut self, cmd: TaskCmd) {
     let msg = match cmd {
-      TaskCmd::Start => return,
+      TaskCmd::Start => {
+        self.pc.send(KernelCommand::TaskStarted);
+        self.pc.send(KernelCommand::TaskReady);
+        return;
+      }
       TaskCmd::Stop | TaskCmd::Kill => {
         self.stop = true;
         return;
       }
+      TaskCmd::Duplicate(_) => return,
       TaskCmd::Msg(msg) => msg,
     };
     let msg = match msg.downcast::<Action>() {
-      Ok(action) => return self.handle_action(*action),
+      Ok(action) => return self.handle_action(None, *action),
       Err(msg) => msg,
     };
-    let msg = match msg.downcast::<ClientEvent>() {
-      Ok(msg) => return self.handle_client(*msg),
-      Err(msg) => msg,
-    };
-    let msg = match msg.downcast::<FramedScreenNotify>() {
-      Ok(notify) => return self.handle_screen_notify(*notify),
+    let msg = match msg.downcast::<TaskScreenCmd>() {
+      Ok(cmd) => return self.handle_screen_cmd(*cmd),
       Err(msg) => msg,
     };
     match msg.downcast::<TaskNotification>() {
@@ -337,108 +358,127 @@ impl App {
     }
   }
 
-  fn handle_client(&mut self, msg: ClientEvent) {
-    match msg {
-      ClientEvent::Input { client_id, event } => {
-        self.handle_input(client_id, event);
-      }
-      ClientEvent::Connected { handle } => {
-        self.clients.push(handle);
-        self.fit_grid();
-        if self.clients.len() == 1 {
-          self.observe_all();
-        }
-      }
-      ClientEvent::Disconnected { client_id } => self.remove_client(client_id),
-    }
-  }
-
-  fn handle_input(&mut self, client_id: ClientId, event: TermEvent) {
-    match event {
-      TermEvent::Key(key) => self.handle_key(client_id, key),
-      TermEvent::Mouse(mouse) => {
-        if self.modal.is_some() {
-          return;
-        }
-        let layout = self.layout();
-        let (x, y) = (mouse.x as u16, mouse.y as u16);
-        let pressed = match mouse.kind {
-          MouseEventKind::Down(_) => true,
-          MouseEventKind::Up(_)
-          | MouseEventKind::Drag(_)
-          | MouseEventKind::Moved
-          | MouseEventKind::ScrollDown
-          | MouseEventKind::ScrollUp
-          | MouseEventKind::ScrollLeft
-          | MouseEventKind::ScrollRight => false,
-        };
-        let term_area = layout.term_area();
-        if term_area.contains(x, y) {
-          if pressed && self.state.scope == Scope::Tasks {
-            self.state.scope = Scope::Term;
-          }
-          if let Some(task) = self.state.current_task() {
-            let event = mouse.translate(term_area);
-            self.pc.send_msg(task.id, TaskScreenCmd::Mouse { event });
-          }
-        } else if layout.sidebar.contains(x, y) {
-          if pressed && self.state.scope == Scope::Term {
-            self.state.scope = Scope::Tasks;
-          }
-          let selected = self.state.selected();
-          match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-              if let Some(index) = task_at(layout.sidebar, x, y, &self.state) {
-                self.state.select(index);
-              }
-            }
-            MouseEventKind::ScrollDown => {
-              self.state.select(selected + 1);
-            }
-            MouseEventKind::ScrollUp => {
-              self.state.select(selected.saturating_sub(1));
-            }
-            MouseEventKind::Down(MouseButton::Right | MouseButton::Middle)
-            | MouseEventKind::Up(_)
-            | MouseEventKind::Drag(_)
-            | MouseEventKind::Moved
-            | MouseEventKind::ScrollLeft
-            | MouseEventKind::ScrollRight => (),
-          }
-        }
-      }
-      TermEvent::Resize(width, height) => {
-        if let Some(client) =
-          self.clients.iter_mut().find(|c| c.id == client_id)
-        {
-          client.size = Size { width, height };
-        }
-        self.fit_grid();
-      }
-      TermEvent::Paste(text) => {
+  /// Commands addressed to the console's own screen. Keys, mouse, and
+  /// pastes are the UI's input; attachments and their geometry go to the
+  /// screen.
+  fn handle_screen_cmd(&mut self, cmd: TaskScreenCmd) {
+    let cmd = match cmd {
+      TaskScreenCmd::Input {
+        observer,
+        event: TermEvent::Key(key),
+      } => return self.handle_key(observer, key),
+      TaskScreenCmd::Input {
+        event: TermEvent::Mouse(mouse),
+        ..
+      } => return self.handle_mouse(mouse),
+      TaskScreenCmd::Input {
+        event: TermEvent::Paste(text),
+        ..
+      } => {
         if self.modal.is_none()
           && self.state.scope.is_term()
           && let Some(task) = self.state.current_task()
         {
-          self.pc.send_msg(task.id, ProcessPaste(text));
+          self.input_current(Some(task.id), TermEvent::Paste(text));
         }
+        return;
       }
-      TermEvent::FocusGained | TermEvent::FocusLost => (),
+      cmd @ (TaskScreenCmd::Attach { .. }
+      | TaskScreenCmd::Detach { .. }
+      | TaskScreenCmd::Input { .. }) => cmd,
+      // Copy mode and scrolling do not apply to a composed UI.
+      TaskScreenCmd::CopyEnter
+      | TaskScreenCmd::CopyLeave
+      | TaskScreenCmd::CopyMove { .. }
+      | TaskScreenCmd::CopyBeginSelection
+      | TaskScreenCmd::Scroll { .. }
+      | TaskScreenCmd::CopyYank => return,
+    };
+    let attached = self.screen.has_observers();
+    self.screen.handle_cmd(cmd, &mut self.effects);
+    self.apply_screen(attached);
+  }
+
+  /// Applies what the screen asked for, and starts or stops watching task
+  /// screens when the first attachment arrives or the last one leaves.
+  fn apply_screen(&mut self, attached: bool) {
+    // The screen resizes the vt itself; nothing else applies to a UI.
+    self.effects.clear();
+    match (attached, self.screen.has_observers()) {
+      (false, true) => self.observe_all(),
+      (true, false) => self.unobserve_all(),
+      (false, false) | (true, true) => (),
     }
   }
 
-  fn handle_key(&mut self, client_id: ClientId, key: Key) {
+  fn handle_mouse(&mut self, mouse: crate::term::mouse::MouseEvent) {
+    if self.modal.is_some() {
+      return;
+    }
+    let layout = self.layout();
+    let (x, y) = (mouse.x as u16, mouse.y as u16);
+    let pressed = match mouse.kind {
+      MouseEventKind::Down(_) => true,
+      MouseEventKind::Up(_)
+      | MouseEventKind::Drag(_)
+      | MouseEventKind::Moved
+      | MouseEventKind::ScrollDown
+      | MouseEventKind::ScrollUp
+      | MouseEventKind::ScrollLeft
+      | MouseEventKind::ScrollRight => false,
+    };
+    let term_area = layout.term_area();
+    if term_area.contains(x, y) {
+      if pressed && self.state.scope == Scope::Tasks {
+        self.state.scope = Scope::Term;
+      }
+      if let Some(task) = self.state.current_task() {
+        let event = mouse.translate(term_area);
+        self.input_current(Some(task.id), TermEvent::Mouse(event));
+      }
+    } else if layout.sidebar.contains(x, y) {
+      if pressed && self.state.scope == Scope::Term {
+        self.state.scope = Scope::Tasks;
+      }
+      let selected = self.state.selected();
+      match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+          if let Some(index) = task_at(layout.sidebar, x, y, &self.state) {
+            self.state.select(index);
+          }
+        }
+        MouseEventKind::ScrollDown => {
+          self.state.select(selected + 1);
+        }
+        MouseEventKind::ScrollUp => {
+          self.state.select(selected.saturating_sub(1));
+        }
+        MouseEventKind::Down(MouseButton::Right | MouseButton::Middle)
+        | MouseEventKind::Up(_)
+        | MouseEventKind::Drag(_)
+        | MouseEventKind::Moved
+        | MouseEventKind::ScrollLeft
+        | MouseEventKind::ScrollRight => (),
+      }
+    }
+  }
+
+  fn handle_key(&mut self, observer: ObserverId, key: Key) {
     match key.kind {
       KeyEventKind::Press | KeyEventKind::Repeat => (),
       KeyEventKind::Release => return,
     }
     if let Some(modal) = &mut self.modal {
-      match modal.handle_key(&key, client_id) {
+      match modal.handle_key(&key) {
         ModalResult::Keep => (),
         ModalResult::Close => self.modal = None,
         ModalResult::Run(action) => {
           self.modal = None;
-          self.handle_action(action);
+          self.handle_action(Some(observer), action);
+        }
+        ModalResult::Detach => {
+          self.modal = None;
+          self.handle_screen_cmd(TaskScreenCmd::Detach { observer });
         }
       }
       return;
@@ -446,40 +486,49 @@ impl App {
     let key = Key::new(key.code, key.mods);
     let group = self.state.keymap_group();
     if let Some(action) = self.keymap.action(group, &key) {
-      self.handle_action(action.clone());
-    } else if self.state.scope.is_term() {
-      self.handle_action(Action::SendKey { key });
+      self.handle_action(Some(observer), action.clone());
+    } else if group == KeymapGroup::Term {
+      // Unbound keys go to the process; in copy mode the keymap is the
+      // whole vocabulary, so they are dropped rather than fed to the
+      // screen's own copy-mode keys.
+      self.handle_action(Some(observer), Action::SendKey { key });
     }
   }
 
-  fn handle_action(&mut self, action: Action) {
+  /// Runs an action, retaining the attachment that originated it when it
+  /// came from terminal input. A quit from an attachment detaches only that
+  /// observer; an out-of-band quit action still addresses the runner.
+  fn handle_action(&mut self, observer: Option<ObserverId>, action: Action) {
     let current = self.state.current_task().map(|t| t.id);
     match action {
       Action::Batch { cmds } => {
         for cmd in cmds {
-          self.handle_action(cmd);
+          self.handle_action(observer, cmd);
         }
       }
 
       Action::QuitOrAsk => self.modal = Some(Box::new(QuitModal)),
-      Action::Quit => {
-        self.state.quitting = true;
-        self.issue(Command::Quit);
-      }
+      Action::Quit => match observer {
+        Some(observer) => {
+          self.handle_screen_cmd(TaskScreenCmd::Detach { observer });
+        }
+        None => {
+          self.state.quitting = true;
+          self.issue(Command::Quit);
+        }
+      },
       Action::ForceQuit => {
         self.state.quitting = true;
         self.issue(Command::Batch {
           commands: vec![
             Command::Kill {
-              target: Target::All {
-                all: TaskSpaceId::default_space(),
-              },
+              target: Target::glob("**"),
             },
             Command::Quit,
           ],
         });
       }
-      Action::Detach { client_id } => self.remove_client(client_id),
+      Action::Command { command } => self.issue(command),
 
       Action::ToggleFocus => self.state.scope = self.state.scope.toggle(),
       Action::FocusTasks => self.state.scope = Scope::Tasks,
@@ -539,18 +588,35 @@ impl App {
         self.modal = Some(Box::new(AddTaskModal::default()))
       }
       Action::AddTask { cmd, name } => {
-        let name = name.unwrap_or_else(|| cmd.clone());
-        let task = TaskConfig {
-          path: self.unique_name(&name, None),
-          cmd: Some(CmdConfig::Shell { shell: cmd }),
-          ..TaskConfig::default()
-        };
-        spawn_config_task(&self.config, &self.pc, task, Vec::new(), true);
+        let label =
+          self.unique_label(&name.unwrap_or_else(|| cmd.clone()), None);
+        let path = unique(&path_name(&label), |path| {
+          self
+            .state
+            .tasks
+            .iter()
+            .any(|t| t.path.as_ref().is_some_and(|p| p.as_str() == path))
+        });
+        match path.parse::<Target>() {
+          Ok(target) => self.issue(Command::Add {
+            target,
+            label: Some(label),
+            cmd: CmdConfig::Shell { shell: cmd },
+            cwd: None,
+            env: None,
+            deps: Vec::new(),
+            tags: Vec::new(),
+          }),
+          Err(err) => log::warn!("Cannot add task '{path}': {err}"),
+        }
       }
       Action::DuplicateTask => {
         if let Some(task) = self.state.current_task() {
-          let name = self.unique_name(&task.name(), None);
-          self.pc.send_msg(task.id, DuplicateTask(Some(name)));
+          let name = self.unique_label(&task.name(), None);
+          self.issue(Command::Duplicate {
+            target: Target::Id(task.id),
+            name: Some(name),
+          });
         }
       }
       Action::ShowRenameTask => {
@@ -558,8 +624,11 @@ impl App {
       }
       Action::RenameTask { name } => {
         if let Some(id) = current {
-          let name = self.unique_name(&name, Some(id));
-          self.pc.set_task_label(id, Some(name));
+          let name = self.unique_label(&name, Some(id));
+          self.issue(Command::Rename {
+            target: Target::Id(id),
+            name,
+          });
         }
       }
       Action::ShowRemoveTask => {
@@ -569,7 +638,6 @@ impl App {
           self.modal = Some(Box::new(RemoveTaskModal { id: task.id }));
         }
       }
-      Action::RemoveTask { id } => self.pc.send(KernelCommand::RemoveTask(id)),
 
       Action::ScrollUp { n, unit } => {
         self.send_current(
@@ -610,30 +678,40 @@ impl App {
       Action::CopyModeCopy => {
         self.send_current(current, TaskScreenCmd::CopyYank)
       }
-      Action::SendKey { key } => self.send_current(current, ProcessInput(key)),
+      Action::SendKey { key } => {
+        self.input_current(current, TermEvent::Key(key))
+      }
     }
   }
 
-  fn unique_name(&self, base: &str, exclude: Option<TaskId>) -> String {
-    let names: Vec<_> =
-      self.state.tasks.iter().map(|t| (t.id, t.name())).collect();
-    unique_task_name(
-      base,
-      exclude,
-      names.iter().map(|(id, name)| (*id, name.as_str())),
-    )
+  fn unique_label(&self, base: &str, exclude: Option<TaskId>) -> String {
+    unique(base, |name| {
+      self
+        .state
+        .tasks
+        .iter()
+        .any(|t| Some(t.id) != exclude && t.name() == name)
+    })
   }
 
-  fn send_current<T: Send + 'static>(&self, current: Option<TaskId>, msg: T) {
+  fn send_current(&self, current: Option<TaskId>, cmd: TaskScreenCmd) {
     if let Some(id) = current {
-      self.pc.send_msg(id, msg);
+      self.pc.send_msg(id, cmd);
     }
+  }
+
+  fn input_current(&self, current: Option<TaskId>, event: TermEvent) {
+    self.send_current(
+      current,
+      TaskScreenCmd::Input {
+        observer: self.observer,
+        event,
+      },
+    );
   }
 
   fn issue(&self, command: Command) {
-    if let Err(err) = issue(&self.pc, &command) {
-      log::error!("Command failed: {err}");
-    }
+    issue(&self.pc, &self.config, command);
   }
 
   fn issue_current(
@@ -642,7 +720,7 @@ impl App {
     make: fn(Target) -> Command,
   ) {
     if let Some(id) = current {
-      self.issue(make(Target::id(id)));
+      self.issue(make(Target::Id(id)));
     }
   }
 
@@ -651,22 +729,25 @@ impl App {
       .state
       .tasks
       .iter()
-      .map(|t| make(Target::id(t.id)))
+      .map(|t| make(Target::Id(t.id)))
       .collect();
     self.issue(Command::Batch { commands });
   }
 
-  fn handle_screen_notify(&mut self, notify: FramedScreenNotify) {
+  fn handle_screen_notify(&mut self, notify: ScreenNotify) {
     match notify {
-      FramedScreenNotify::ObserveStarted { .. }
-      | FramedScreenNotify::Render { .. }
-      | FramedScreenNotify::Bell { .. } => (),
-      FramedScreenNotify::CopyPresent { task_id, vt } => {
-        if let Some(task) = self.state.task_mut(task_id) {
+      ScreenNotify::Attached | ScreenNotify::Render | ScreenNotify::Bell => (),
+      ScreenNotify::CopyPresent { screen, vt } => {
+        if let Some(task) = self.state.task_mut(screen) {
           task.present = vt;
         }
       }
-      FramedScreenNotify::Yank { text } => crate::clipboard::copy(&text),
+      // Copied on behalf of whoever is attached here.
+      ScreenNotify::Yank { text } => {
+        let attached = self.screen.has_observers();
+        self.screen.yank(text, &mut self.effects);
+        self.apply_screen(attached);
+      }
     }
   }
 
@@ -690,11 +771,6 @@ impl App {
         match index {
           Some(index) if index < selected => self.state.select(selected - 1),
           _ => self.state.select(selected),
-        }
-      }
-      TaskNotify::PathChanged(_, path) => {
-        if let Some(task) = self.state.task_mut(id) {
-          task.path = path;
         }
       }
       TaskNotify::LabelChanged(label) => {

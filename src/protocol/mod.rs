@@ -1,6 +1,7 @@
 pub mod conn;
 pub mod ctl;
 pub mod rpc;
+pub mod screen;
 pub mod wire;
 
 pub use conn::{
@@ -9,5 +10,6 @@ pub use conn::{
 pub use ctl::{Bye, CtlMsg, Event, Request, RpcError, codes};
 pub use rpc::{
   ActResult, RpcRequest, RpcState, RpcTaskInfo, RpcWhy, RpcWhyDep,
-  ScreenResult, SpawnResult, TaskListResult, ok_result,
+  ScreenResult, TaskListResult, ok_result,
 };
+pub use screen::ScreenCommand;

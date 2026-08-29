@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::console::action::{Action, CopyMove as ActionCopyMove, ScrollUnit};
-use crate::console::client::ClientId;
 use crate::kernel::task::TaskId;
 use crate::term::key::{Key, key_spec};
 
@@ -15,9 +14,6 @@ pub enum AppEvent {
   QuitOrAsk,
   Quit,
   ForceQuit,
-  Detach {
-    client_id: ClientId,
-  },
 
   ToggleFocus,
   FocusProcs,
@@ -88,7 +84,6 @@ impl AppEvent {
       AppEvent::QuitOrAsk => Action::QuitOrAsk,
       AppEvent::Quit => Action::Quit,
       AppEvent::ForceQuit => Action::ForceQuit,
-      AppEvent::Detach { client_id } => Action::Detach { client_id },
       AppEvent::ToggleFocus => Action::ToggleFocus,
       AppEvent::FocusProcs => Action::FocusTasks,
       AppEvent::FocusTerm => Action::FocusTerm,
@@ -110,7 +105,11 @@ impl AppEvent {
       AppEvent::AddProc { cmd, name } => Action::AddTask { cmd, name },
       AppEvent::DuplicateProc => Action::DuplicateTask,
       AppEvent::ShowRemoveProc => Action::ShowRemoveTask,
-      AppEvent::RemoveProc { id } => Action::RemoveTask { id },
+      AppEvent::RemoveProc { id } => Action::Command {
+        command: crate::command::Command::Remove {
+          target: crate::target::Target::Id(id),
+        },
+      },
       AppEvent::CloseCurrentModal => Action::CloseCurrentModal,
       AppEvent::ScrollDownLines { n } => Action::ScrollDown {
         n,

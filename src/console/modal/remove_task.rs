@@ -1,6 +1,8 @@
+use crate::command::Command;
 use crate::console::action::Action;
-use crate::console::{client::ClientId, keymap::Keymap};
+use crate::console::keymap::Keymap;
 use crate::kernel::task::TaskId;
+use crate::target::Target;
 use crate::term::{
   Grid,
   attrs::Attrs,
@@ -15,14 +17,16 @@ pub struct RemoveTaskModal {
 }
 
 impl Modal for RemoveTaskModal {
-  fn handle_key(&mut self, key: &Key, _client_id: ClientId) -> ModalResult {
+  fn handle_key(&mut self, key: &Key) -> ModalResult {
     if !key.mods.is_empty() {
       return ModalResult::Keep;
     }
     match key.code {
-      KeyCode::Char('y') => {
-        ModalResult::Run(Action::RemoveTask { id: self.id })
-      }
+      KeyCode::Char('y') => ModalResult::Run(Action::Command {
+        command: Command::Remove {
+          target: Target::Id(self.id),
+        },
+      }),
       KeyCode::Char('n') | KeyCode::Esc => ModalResult::Close,
       _ => ModalResult::Keep,
     }

@@ -1,4 +1,4 @@
-use crate::console::{action::Action, client::ClientId, keymap::Keymap};
+use crate::console::{action::Action, keymap::Keymap};
 use crate::term::{Grid, grid::Rect, key::Key};
 
 pub enum ModalResult {
@@ -6,10 +6,12 @@ pub enum ModalResult {
   Close,
   /// Close the modal, then run the action.
   Run(Action),
+  /// Close the modal and detach the attachment that pressed the key.
+  Detach,
 }
 
 pub trait Modal: Send {
-  fn handle_key(&mut self, key: &Key, client_id: ClientId) -> ModalResult;
+  fn handle_key(&mut self, key: &Key) -> ModalResult;
 
   fn size(&self) -> (u16, u16);
 

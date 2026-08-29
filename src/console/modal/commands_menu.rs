@@ -2,7 +2,6 @@ use tui_input::Input;
 
 use crate::console::action::{Action, ScrollUnit};
 use crate::console::{
-  client::ClientId,
   keymap::{Keymap, KeymapGroup},
   widgets::{
     list::ListState,
@@ -42,7 +41,7 @@ impl CommandsMenuModal {
 }
 
 impl Modal for CommandsMenuModal {
-  fn handle_key(&mut self, key: &Key, _client_id: ClientId) -> ModalResult {
+  fn handle_key(&mut self, key: &Key) -> ModalResult {
     let count = self.items.len();
     match (key.code, key.mods) {
       (KeyCode::Enter, KeyMods::NONE) => {
@@ -54,7 +53,9 @@ impl Modal for CommandsMenuModal {
       (KeyCode::Esc, KeyMods::NONE) => return ModalResult::Close,
       (KeyCode::Up, KeyMods::NONE) | (KeyCode::Char('p'), KeyMods::CONTROL) => {
         if count > 0 {
-          self.list.select((self.list.selected() + count - 1) % count, count);
+          self
+            .list
+            .select((self.list.selected() + count - 1) % count, count);
         }
         return ModalResult::Keep;
       }

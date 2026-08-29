@@ -3,9 +3,11 @@ use std::process::Stdio;
 use anyhow::Result;
 use which::which;
 
+/// The system clipboard of the machine the runner is on. Attachments
+/// also receive copied text as OSC 52, so a terminal that supports it
+/// needs none of this.
 #[allow(dead_code)]
 enum Provider {
-  OSC52,
   Exec(&'static str, Vec<&'static str>),
   #[cfg(windows)]
   Win,
@@ -22,7 +24,7 @@ fn detect_copy_provider() -> Provider {
   if let Some(provider) = check_prog("pbcopy", &[]) {
     return provider;
   }
-  Provider::OSC52
+  Provider::NoOp
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -55,7 +57,7 @@ fn detect_copy_provider() -> Provider {
     }
   }
 
-  Provider::OSC52
+  Provider::NoOp
 }
 
 #[allow(dead_code)]
@@ -69,14 +71,6 @@ fn check_prog(cmd: &'static str, args: &[&'static str]) -> Option<Provider> {
 
 fn copy_impl(s: &str, provider: &Provider) -> Result<()> {
   match provider {
-    Provider::OSC52 => {
-      let mut stdout = std::io::stdout().lock();
-      use std::io::Write;
-      let mut seq = Vec::new();
-      crate::term::vt::emit::osc52_copy(&mut seq, s);
-      stdout.write_all(&seq)?;
-    }
-
     Provider::Exec(prog, args) => {
       let mut child = std::process::Command::new(prog)
         .args(args)

@@ -10,8 +10,11 @@ use crate::{
     task_log::LogMode,
   },
   kernel::{
-    kernel_message::{TaskContext, TaskRegistration},
+    kernel_message::{
+      RegisterError, TaskContext, TaskRegistration, TaskSelector,
+    },
     task::{RestartMode, TaskId},
+    task_key::{TaskKey, TaskSpaceId},
     task_path::TaskPath,
   },
   process::process_spec::ProcessSpec,
@@ -37,17 +40,26 @@ pub async fn register_config_tasks(
       let pinned = cfg.autostart();
       pc.register_task(config_task_registration(
         config,
+        TaskSpaceId::default_space(),
         cfg,
         task_ids[i],
-        deps_by_task[i].clone(),
+        deps_by_task[i]
+          .iter()
+          .copied()
+          .map(TaskSelector::Id)
+          .collect(),
         pinned,
       ))
     })
     .collect::<Vec<_>>();
   let outcomes = try_join_all(replies).await?;
   for (i, registered) in order.into_iter().zip(outcomes) {
-    if !registered {
-      bail!("Failed to register task '{}'.", config.tasks[i].path);
+    if let Err(err) = registered {
+      bail!(
+        "Failed to register task '{}': {}",
+        config.tasks[i].path,
+        err
+      );
     }
   }
 
@@ -57,42 +69,27 @@ pub async fn register_config_tasks(
 pub fn spawn_config_task(
   config: &Config,
   pc: &TaskContext,
+  space: TaskSpaceId,
   cfg: TaskConfig,
-  deps: Vec<TaskId>,
+  deps: Vec<TaskSelector>,
   pinned: bool,
-) -> (TaskId, tokio::sync::oneshot::Receiver<bool>) {
+) -> (
+  TaskId,
+  tokio::sync::oneshot::Receiver<Result<(), RegisterError>>,
+) {
   let task_id = pc.alloc_id();
   let ack = pc.register_task(config_task_registration(
-    config, cfg, task_id, deps, pinned,
+    config, space, cfg, task_id, deps, pinned,
   ));
   (task_id, ack)
 }
 
-pub fn unique_task_name<'a>(
-  base: &str,
-  exclude: Option<TaskId>,
-  tasks: impl IntoIterator<Item = (TaskId, &'a str)>,
-) -> String {
-  let tasks = tasks.into_iter().collect::<Vec<_>>();
-  let taken = |name: &str| {
-    tasks
-      .iter()
-      .any(|(id, task_name)| Some(*id) != exclude && *task_name == name)
-  };
-  if !taken(base) {
-    return base.to_string();
-  }
-  (2..)
-    .map(|n| format!("{}-{}", base, n))
-    .find(|name| !taken(name))
-    .unwrap()
-}
-
 fn config_task_registration(
   config: &Config,
+  space: TaskSpaceId,
   cfg: TaskConfig,
   task_id: TaskId,
-  deps: Vec<TaskId>,
+  deps: Vec<TaskSelector>,
   pinned: bool,
 ) -> TaskRegistration {
   let merged = config.defaults.clone().overlay(cfg);
@@ -101,7 +98,7 @@ fn config_task_registration(
     .ok();
   process_task_registration(
     task_id,
-    path,
+    path.map(|path| TaskKey::new(space, path)),
     process_task_config(&merged, task_id, deps, pinned),
   )
 }
@@ -109,7 +106,7 @@ fn config_task_registration(
 fn process_task_config(
   cfg: &TaskConfig,
   task_id: TaskId,
-  deps: Vec<TaskId>,
+  deps: Vec<TaskSelector>,
   pinned: bool,
 ) -> ProcessTaskConfig {
   let log = cfg.log.clone().map(|log_cfg| {
@@ -135,7 +132,7 @@ fn process_task_config(
     scrollback_len: cfg.scrollback_len(),
     mouse_scroll_speed: cfg.mouse_scroll_speed(),
     deps,
-    label: Some(cfg.path.clone()),
+    label: Some(cfg.label.clone().unwrap_or_else(|| cfg.path.clone())),
     tags: {
       let mut tags = cfg.tags.clone();
       if cfg.autostart() {
@@ -298,8 +295,10 @@ mod tests {
   use crate::config::task::CmdConfig;
   use crate::kernel::{
     kernel::Kernel,
-    kernel_message::{KernelCommand, KernelQuery, KernelQueryResponse},
-    task_key::{TaskKey, TaskSpaceId},
+    kernel_message::{
+      KernelCommand, KernelQuery, KernelQueryResponse, SpaceSelector,
+      TaskSelector,
+    },
   };
 
   use super::*;
@@ -354,19 +353,6 @@ mod tests {
     );
   }
 
-  #[test]
-  fn uniquifies_runtime_task_names() {
-    let tasks = [(TaskId(1), "web"), (TaskId(2), "web-2")];
-    assert_eq!(
-      unique_task_name("web", None, tasks.iter().copied()),
-      "web-3"
-    );
-    assert_eq!(
-      unique_task_name("web", Some(TaskId(1)), tasks.iter().copied()),
-      "web"
-    );
-  }
-
   #[tokio::test]
   async fn registers_before_returning() {
     let mut config = Config::make_default();
@@ -378,7 +364,7 @@ mod tests {
     register_config_tasks(&config, &pc).await.unwrap();
 
     let response = pc
-      .query(KernelQuery::ListTasks(TaskSpaceId::default_space(), None))
+      .query(KernelQuery::ListTasks(TaskSelector::all()))
       .await
       .unwrap();
     let KernelQueryResponse::TaskList(tasks) = response else {
@@ -386,15 +372,17 @@ mod tests {
     };
     assert_eq!(tasks.len(), 2);
     let response = pc
-      .query(KernelQuery::Explain(TaskKey::default_space(
-        TaskPath::new("api").unwrap(),
+      .query(KernelQuery::Explain(TaskSelector::Glob(
+        SpaceSelector::default_space(),
+        "api".to_string(),
       )))
       .await
       .unwrap();
-    let KernelQueryResponse::Explain(Some(explain)) = response else {
+    let KernelQueryResponse::Explain(explains) = response else {
       panic!("unexpected response");
     };
-    assert_eq!(explain.deps[0].name, "db");
+    assert_eq!(explains.len(), 1);
+    assert_eq!(explains[0].deps[0].name, "db");
 
     pc.send(KernelCommand::Quit);
     handle.await.unwrap();

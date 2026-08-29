@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{
+  kernel_message::SpaceSelector,
   path_trie::{PathConflictError, PathTrie},
   sub_trie::{SubMode, SubTrie},
   task::TaskId,
@@ -61,29 +62,16 @@ impl Namespace {
       .and_then(|space| space.paths.remove(&key.path))
   }
 
-  pub fn resolve(&self, key: &TaskKey) -> Option<TaskId> {
-    self
-      .spaces
-      .get(&key.space)
-      .and_then(|space| space.paths.resolve(&key.path))
-  }
-
-  pub fn glob(
-    &self,
-    space: &TaskSpaceId,
-    pattern: &str,
-  ) -> Vec<(TaskPath, TaskId)> {
-    self
-      .spaces
-      .get(space)
-      .map_or_else(Vec::new, |ns| ns.paths.glob(pattern))
-  }
-
-  pub fn iter(&self, space: &TaskSpaceId) -> Vec<(TaskPath, TaskId)> {
-    self
-      .spaces
-      .get(space)
-      .map_or_else(Vec::new, |ns| ns.paths.iter())
+  pub fn glob(&self, space: &SpaceSelector, pattern: &str) -> Vec<TaskId> {
+    let spaces: Vec<&SpaceNamespace> = match space {
+      SpaceSelector::One(space) => self.spaces.get(space).into_iter().collect(),
+      SpaceSelector::Any => self.spaces.values().collect(),
+    };
+    spaces
+      .into_iter()
+      .flat_map(|ns| ns.paths.glob(pattern))
+      .map(|(_, id)| id)
+      .collect()
   }
 
   /// Tasks a subscription at `key` with `mode` would match.

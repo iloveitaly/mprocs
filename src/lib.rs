@@ -14,6 +14,7 @@ pub mod mprocs;
 mod parse_shell;
 mod process;
 mod protocol;
+mod target;
 mod task;
 mod term;
 mod term_driver;

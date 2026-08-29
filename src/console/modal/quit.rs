@@ -1,5 +1,5 @@
 use crate::console::action::Action;
-use crate::console::{client::ClientId, keymap::Keymap};
+use crate::console::keymap::Keymap;
 use crate::term::{
   Grid,
   attrs::Attrs,
@@ -12,13 +12,15 @@ use super::modal::{Modal, ModalResult};
 pub struct QuitModal;
 
 impl Modal for QuitModal {
-  fn handle_key(&mut self, key: &Key, client_id: ClientId) -> ModalResult {
+  fn handle_key(&mut self, key: &Key) -> ModalResult {
     if !key.mods.is_empty() {
       return ModalResult::Keep;
     }
     match key.code {
-      KeyCode::Char('e') => ModalResult::Run(Action::Quit),
-      KeyCode::Char('d') => ModalResult::Run(Action::Detach { client_id }),
+      KeyCode::Char('e') => ModalResult::Run(Action::Command {
+        command: crate::command::Command::Quit,
+      }),
+      KeyCode::Char('d') => ModalResult::Detach,
       KeyCode::Char('n') | KeyCode::Esc => ModalResult::Close,
       _ => ModalResult::Keep,
     }

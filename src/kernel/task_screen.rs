@@ -1,22 +1,42 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use bytes::Bytes;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{Sender, UnboundedSender};
 
 use crate::{
   kernel::{
     copy_mode::{CopyMove, CopyState, Pos},
-    kernel_message::{SharedVt, TaskSender},
+    kernel_message::SharedVt,
     task::TaskId,
   },
   term::{
     Color, MouseProtocolEncoding, MouseProtocolMode, Reply, Screen, Size,
-    VtEvent, Winsize,
+    TermEvent, VtEvent, Winsize,
     attrs::Attrs,
     grid::{Pos as GridPos, Rect},
-    key::KeyMods,
+    key::{Key, KeyCode, KeyMods},
     mouse::{MouseButton, MouseEvent, MouseEventKind},
     vt::emit,
   },
 };
+
+/// Size of a screen nothing is attached to yet.
+pub const DEFAULT_SIZE: Size = Size {
+  width: 80,
+  height: 24,
+};
+
+/// Identifies one attachment to a screen. Allocated by the attacher, so
+/// an attach needs no handshake before input and resize can follow it.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ObserverId(u64);
+
+impl ObserverId {
+  pub fn new() -> Self {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    ObserverId(NEXT.fetch_add(1, Ordering::Relaxed))
+  }
+}
 
 pub struct TaskScreen {
   task_id: TaskId,
@@ -25,8 +45,12 @@ pub struct TaskScreen {
   // Per-read events buffer; drained at the end of each process().
   events_buf: Vec<VtEvent>,
 
-  observers: Vec<TaskScreenObs>,
-  next_direct_id: u64,
+  observers: Vec<Observer>,
+  /// An observer's sink closed since the last `settle`.
+  lost_observers: bool,
+  /// Raw output sinks (log files); they never affect the size.
+  loggers: Vec<(u64, Sender<Bytes>)>,
+  next_logger_id: u64,
 
   copy: Option<CopySession>,
   /// Content cell of the last left mouse-down, so a drag can anchor the
@@ -41,26 +65,27 @@ struct CopySession {
   present: SharedVt,
 }
 
-struct TaskScreenObs {
-  target: ObsTarget,
-}
-
-enum ObsTarget {
-  Framed { sender: TaskSender, size: Winsize },
-  Direct { id: u64, sink: Sender<Bytes> },
+struct Observer {
+  id: ObserverId,
+  size: Winsize,
+  sink: UnboundedSender<ScreenNotify>,
 }
 
 pub enum TaskScreenCmd {
-  Observe {
+  Attach {
+    observer: ObserverId,
     size: Winsize,
-    sender: TaskSender,
+    sink: UnboundedSender<ScreenNotify>,
   },
-  Unobserve {
-    observer_id: TaskId,
+  Detach {
+    observer: ObserverId,
   },
-  Resize {
-    size: Winsize,
-    observer_id: TaskId,
+  /// Terminal input from an attached observer. Resizes change that
+  /// observer's requested geometry; keys and pastes not consumed by copy
+  /// mode come back as effects for the task to feed its process.
+  Input {
+    observer: ObserverId,
+    event: TermEvent,
   },
 
   CopyEnter,
@@ -75,9 +100,6 @@ pub enum TaskScreenCmd {
     unit: ScrollUnit,
   },
   CopyYank,
-  Mouse {
-    event: MouseEvent,
-  },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -87,20 +109,16 @@ pub enum ScrollUnit {
   Screen,
 }
 
-pub enum FramedScreenNotify {
-  ObserveStarted {
-    task_id: TaskId,
-  },
-  Render {
-    task_id: TaskId,
-  },
-
-  Bell {
-    task_id: TaskId,
-  },
-
+/// Delivered to an observer's sink. An observer whose sink is closed is
+/// dropped; a screen that goes away closes every sink it held.
+pub enum ScreenNotify {
+  /// The attach took effect; paint the screen.
+  Attached,
+  Render,
+  Bell,
+  /// Copy mode began (`Some`, draw this surface instead) or ended.
   CopyPresent {
-    task_id: TaskId,
+    screen: TaskId,
     vt: Option<SharedVt>,
   },
   Yank {
@@ -111,6 +129,8 @@ pub enum FramedScreenNotify {
 pub enum TaskScreenEffect {
   Write(Vec<u8>),
   Resize(Winsize),
+  Key(Key),
+  Paste(String),
 }
 
 impl TaskScreen {
@@ -137,21 +157,47 @@ impl TaskScreen {
       vt,
       events_buf: Vec::new(),
       observers: Vec::new(),
-      next_direct_id: 0,
+      lost_observers: false,
+      loggers: Vec::new(),
+      next_logger_id: 0,
       copy: None,
       mouse_down: None,
       wheel_lines: wheel_lines.max(1),
     }
   }
 
-  fn broadcast(&self, mut make: impl FnMut(TaskId) -> FramedScreenNotify) {
+  pub fn has_observers(&self) -> bool {
+    !self.observers.is_empty()
+  }
+
+  fn broadcast(&mut self, mut make: impl FnMut(TaskId) -> ScreenNotify) {
     let task_id = self.task_id;
-    for obs in &self.observers {
-      match &obs.target {
-        ObsTarget::Framed { sender, .. } => sender.send(make(task_id)),
-        ObsTarget::Direct { .. } => {}
-      }
+    let before = self.observers.len();
+    self
+      .observers
+      .retain(|obs| obs.sink.send(make(task_id)).is_ok());
+    if self.observers.len() != before {
+      self.lost_observers = true;
     }
+  }
+
+  /// Observers that vanished without detaching must stop shaping the size.
+  fn settle(&mut self, effects: &mut Vec<TaskScreenEffect>) {
+    if std::mem::take(&mut self.lost_observers) {
+      self.apply_size(effects);
+    }
+  }
+
+  /// The task drew into `vt` itself (a UI rather than process output).
+  pub fn rendered(&mut self, effects: &mut Vec<TaskScreenEffect>) {
+    self.broadcast(|_| ScreenNotify::Render);
+    self.settle(effects);
+  }
+
+  /// Text copied on this task's behalf (e.g. by a screen it shows).
+  pub fn yank(&mut self, text: String, effects: &mut Vec<TaskScreenEffect>) {
+    self.broadcast(|_| ScreenNotify::Yank { text: text.clone() });
+    self.settle(effects);
   }
 
   pub async fn process(
@@ -163,17 +209,16 @@ impl TaskScreen {
       vt.process(bytes, &mut self.events_buf);
     }
 
-    for event in &self.events_buf {
-      match event {
-        VtEvent::Bell => {
-          self.broadcast(|task_id| FramedScreenNotify::Bell { task_id })
-        }
-        VtEvent::Reply(_) => (),
-      }
+    let bell = self.events_buf.iter().any(|event| match event {
+      VtEvent::Bell => true,
+      VtEvent::Reply(_) => false,
+    });
+    if bell {
+      self.broadcast(|_| ScreenNotify::Bell);
     }
-    self.broadcast(|task_id| FramedScreenNotify::Render { task_id });
+    self.broadcast(|_| ScreenNotify::Render);
 
-    for event in self.events_buf.drain(..) {
+    for event in std::mem::take(&mut self.events_buf) {
       match event {
         VtEvent::Bell => (),
         VtEvent::Reply(reply) => {
@@ -190,21 +235,13 @@ impl TaskScreen {
       }
     }
 
-    let has_direct = self.observers.iter().any(|o| match &o.target {
-      ObsTarget::Direct { .. } => true,
-      ObsTarget::Framed { .. } => false,
-    });
-    if has_direct {
+    if !self.loggers.is_empty() {
       let bytes = Bytes::copy_from_slice(bytes);
-      for obs in &self.observers {
-        match &obs.target {
-          ObsTarget::Direct { sink, .. } => {
-            let _ = sink.send(bytes.clone()).await;
-          }
-          ObsTarget::Framed { .. } => {}
-        }
+      for (_, sink) in &self.loggers {
+        let _ = sink.send(bytes.clone()).await;
       }
     }
+    self.settle(effects);
   }
 
   pub fn handle_cmd(
@@ -213,57 +250,79 @@ impl TaskScreen {
     effects: &mut Vec<TaskScreenEffect>,
   ) {
     match cmd {
-      TaskScreenCmd::Observe { size, sender } => {
-        sender.send(FramedScreenNotify::ObserveStarted {
-          task_id: self.task_id,
+      TaskScreenCmd::Attach {
+        observer,
+        size,
+        sink,
+      } => {
+        // Re-attaching replaces the previous registration.
+        self.observers.retain(|o| o.id != observer);
+        self.observers.push(Observer {
+          id: observer,
+          size,
+          sink,
         });
-        // A late joiner during copy mode must also render the presentation.
-        if let Some(session) = &self.copy {
-          sender.send(FramedScreenNotify::CopyPresent {
-            task_id: self.task_id,
-            vt: Some(session.present.clone()),
-          });
+        // Size first so Attached/CopyPresent paint the applied geometry.
+        let resized = self.sync_size(effects);
+        if resized && self.copy.is_some() {
+          self.render_present();
         }
-        // Re-observe replaces the previous registration.
-        self.observers.retain(|o| match &o.target {
-          ObsTarget::Framed { sender: s, .. } => s.task_id != sender.task_id,
-          ObsTarget::Direct { .. } => true,
-        });
-        self.observers.push(TaskScreenObs {
-          target: ObsTarget::Framed { sender, size },
-        });
-        self.sync_size(effects);
-      }
-      TaskScreenCmd::Unobserve { observer_id } => {
-        self.observers.retain(|o| match &o.target {
-          ObsTarget::Framed { sender, .. } => sender.task_id != observer_id,
-          ObsTarget::Direct { .. } => true,
-        });
-        self.sync_size(effects);
-      }
-      TaskScreenCmd::Resize { size, observer_id } => {
-        let observer = self.observers.iter_mut().find(|o| match &o.target {
-          ObsTarget::Framed { sender, .. } => sender.task_id == observer_id,
-          ObsTarget::Direct { .. } => false,
-        });
-        if let Some(observer) = observer {
-          if let ObsTarget::Framed { size: obs_size, .. } = &mut observer.target
-          {
-            *obs_size = size;
+        if let Some(obs) = self.observers.last() {
+          let _ = obs.sink.send(ScreenNotify::Attached);
+          if let Some(session) = &self.copy {
+            let _ = obs.sink.send(ScreenNotify::CopyPresent {
+              screen: self.task_id,
+              vt: Some(session.present.clone()),
+            });
           }
         }
-        self.sync_size(effects);
-        if self.copy.is_some() {
-          self.render_present();
-          self.broadcast(|task_id| FramedScreenNotify::Render { task_id });
+        if resized {
+          self.broadcast(|_| ScreenNotify::Render);
         }
       }
+      TaskScreenCmd::Detach { observer } => {
+        self.observers.retain(|o| o.id != observer);
+        self.apply_size(effects);
+      }
+      TaskScreenCmd::Input { observer, event } => match event {
+        TermEvent::Resize(width, height) => {
+          if let Some(obs) =
+            self.observers.iter_mut().find(|o| o.id == observer)
+          {
+            obs.size = Winsize {
+              x: width,
+              y: height,
+              x_px: 0,
+              y_px: 0,
+            };
+          }
+          self.apply_size(effects);
+          if self.copy.is_some() {
+            self.render_present();
+            self.broadcast(|_| ScreenNotify::Render);
+          }
+        }
+        TermEvent::Mouse(event) => self.handle_mouse(event, effects),
+        TermEvent::Key(key) => {
+          if self.copy.is_some() {
+            self.copy_key(key);
+          } else {
+            effects.push(TaskScreenEffect::Key(key));
+          }
+        }
+        TermEvent::Paste(text) => {
+          if self.copy.is_none() {
+            effects.push(TaskScreenEffect::Paste(text));
+          }
+        }
+        TermEvent::FocusGained | TermEvent::FocusLost => (),
+      },
 
       TaskScreenCmd::CopyEnter => {
         if let Some(present) = self.enter_copy() {
           self.render_present();
-          self.broadcast(|task_id| FramedScreenNotify::CopyPresent {
-            task_id,
+          self.broadcast(|screen| ScreenNotify::CopyPresent {
+            screen,
             vt: Some(present.clone()),
           });
         }
@@ -271,34 +330,53 @@ impl TaskScreen {
       TaskScreenCmd::CopyLeave => {
         self.leave_copy();
       }
-      TaskScreenCmd::CopyMove { dir } => {
-        if let Some(session) = &mut self.copy {
-          session.state.move_cursor(dir);
-          self.render_present();
-          self.broadcast(|task_id| FramedScreenNotify::Render { task_id });
-        }
-      }
-      TaskScreenCmd::CopyBeginSelection => {
-        if let Some(session) = &mut self.copy {
-          session.state.begin_selection();
-          self.render_present();
-          self.broadcast(|task_id| FramedScreenNotify::Render { task_id });
-        }
-      }
+      TaskScreenCmd::CopyMove { dir } => self.copy_move(dir),
+      TaskScreenCmd::CopyBeginSelection => self.copy_begin_selection(),
       TaskScreenCmd::Scroll { delta, unit } => self.scroll(delta, unit),
-      TaskScreenCmd::Mouse { event } => {
-        self.handle_mouse(event, effects);
-      }
-      TaskScreenCmd::CopyYank => {
-        let text = self.copy.as_ref().and_then(|s| s.state.selected_text());
-        if let Some(text) = text {
-          self.broadcast(|_task_id| FramedScreenNotify::Yank {
-            text: text.clone(),
-          });
-        }
-        self.leave_copy();
-      }
+      TaskScreenCmd::CopyYank => self.copy_yank(),
     }
+    self.settle(effects);
+  }
+
+  /// Keys an attachment with no keymap of its own can use in copy mode.
+  fn copy_key(&mut self, key: Key) {
+    if key.mods != KeyMods::NONE {
+      return;
+    }
+    match key.code {
+      KeyCode::Esc => self.leave_copy(),
+      KeyCode::Enter | KeyCode::Char('y') => self.copy_yank(),
+      KeyCode::Char('v') | KeyCode::Char(' ') => self.copy_begin_selection(),
+      KeyCode::Up | KeyCode::Char('k') => self.copy_move(CopyMove::Up),
+      KeyCode::Down | KeyCode::Char('j') => self.copy_move(CopyMove::Down),
+      KeyCode::Left | KeyCode::Char('h') => self.copy_move(CopyMove::Left),
+      KeyCode::Right | KeyCode::Char('l') => self.copy_move(CopyMove::Right),
+      _ => (),
+    }
+  }
+
+  fn copy_move(&mut self, dir: CopyMove) {
+    if let Some(session) = &mut self.copy {
+      session.state.move_cursor(dir);
+      self.render_present();
+      self.broadcast(|_| ScreenNotify::Render);
+    }
+  }
+
+  fn copy_begin_selection(&mut self) {
+    if let Some(session) = &mut self.copy {
+      session.state.begin_selection();
+      self.render_present();
+      self.broadcast(|_| ScreenNotify::Render);
+    }
+  }
+
+  fn copy_yank(&mut self) {
+    let text = self.copy.as_ref().and_then(|s| s.state.selected_text());
+    if let Some(text) = text {
+      self.broadcast(|_| ScreenNotify::Yank { text: text.clone() });
+    }
+    self.leave_copy();
   }
 
   /// Freezes the live screen into a copy session. Returns the presentation
@@ -324,10 +402,7 @@ impl TaskScreen {
 
   fn leave_copy(&mut self) {
     if self.copy.take().is_some() {
-      self.broadcast(|task_id| FramedScreenNotify::CopyPresent {
-        task_id,
-        vt: None,
-      });
+      self.broadcast(|screen| ScreenNotify::CopyPresent { screen, vt: None });
     }
   }
 
@@ -372,7 +447,7 @@ impl TaskScreen {
           let pos = session.state.pos_at(row, col);
           session.state.set_anchor(pos);
           self.render_present();
-          self.broadcast(|task_id| FramedScreenNotify::Render { task_id });
+          self.broadcast(|_| ScreenNotify::Render);
         }
       }
       MouseEventKind::Drag(MouseButton::Left) => {
@@ -389,15 +464,11 @@ impl TaskScreen {
         }
         self.render_present();
         match entered {
-          Some(present) => {
-            self.broadcast(|task_id| FramedScreenNotify::CopyPresent {
-              task_id,
-              vt: Some(present.clone()),
-            })
-          }
-          None => {
-            self.broadcast(|task_id| FramedScreenNotify::Render { task_id })
-          }
+          Some(present) => self.broadcast(|screen| ScreenNotify::CopyPresent {
+            screen,
+            vt: Some(present.clone()),
+          }),
+          None => self.broadcast(|_| ScreenNotify::Render),
         }
       }
       MouseEventKind::Up(_) => self.mouse_down = None,
@@ -439,7 +510,7 @@ impl TaskScreen {
         screen.scroll_screen_down(delta.unsigned_abs() as usize);
       }
     }
-    self.broadcast(|task_id| FramedScreenNotify::Render { task_id });
+    self.broadcast(|_| ScreenNotify::Render);
   }
 
   /// Composes the frozen snapshot (scrolled), the selection highlight, the HUD
@@ -519,41 +590,52 @@ impl TaskScreen {
     }
   }
 
-  pub fn add_direct_observer(&mut self, sink: Sender<Bytes>) -> u64 {
-    let id = self.next_direct_id;
-    self.next_direct_id += 1;
-    self.observers.push(TaskScreenObs {
-      target: ObsTarget::Direct { id, sink },
-    });
+  pub fn add_logger(&mut self, sink: Sender<Bytes>) -> u64 {
+    let id = self.next_logger_id;
+    self.next_logger_id += 1;
+    self.loggers.push((id, sink));
     id
   }
 
-  pub fn remove_direct_observer(&mut self, id: u64) {
-    self.observers.retain(|o| match &o.target {
-      ObsTarget::Direct { id: oid, .. } => *oid != id,
-      ObsTarget::Framed { .. } => true,
-    });
+  pub fn remove_logger(&mut self, id: u64) {
+    self.loggers.retain(|(logger, _)| *logger != id);
   }
 
-  pub fn sync_size(&mut self, effects: &mut Vec<TaskScreenEffect>) {
+  fn apply_size(&mut self, effects: &mut Vec<TaskScreenEffect>) -> bool {
+    if !self.sync_size(effects) {
+      return false;
+    }
+    if self.copy.is_some() {
+      self.render_present();
+    }
+    self.broadcast(|_| ScreenNotify::Render);
+    true
+  }
+
+  fn sync_size(&mut self, effects: &mut Vec<TaskScreenEffect>) -> bool {
     // The smallest attached viewer wins, so every observer sees the whole
-    // screen. With no framed observers the last size is kept.
-    let mut size: Option<Winsize> = None;
-    for obs in &self.observers {
-      match &obs.target {
-        ObsTarget::Framed { size: s, .. } => {
-          let acc = size.get_or_insert(*s);
-          acc.x = acc.x.min(s.x);
-          acc.y = acc.y.min(s.y);
-        }
-        ObsTarget::Direct { .. } => {}
-      }
+    // screen. With no observers the last size is kept.
+    let size = self
+      .observers
+      .iter()
+      .map(|obs| obs.size)
+      .reduce(|a, b| Winsize {
+        x: a.x.min(b.x),
+        y: a.y.min(b.y),
+        x_px: 0,
+        y_px: 0,
+      })
+      .unwrap_or(self.size);
+    if size == self.size {
+      return false;
     }
-    let size = size.unwrap_or(self.size);
-    if size != self.size {
-      self.size = size;
-      effects.push(TaskScreenEffect::Resize(size));
+    self.size = size;
+    // Observers paint from vt; resize it before the following Render.
+    if let Ok(mut vt) = self.vt.write() {
+      vt.set_size(size.y, size.x);
     }
+    effects.push(TaskScreenEffect::Resize(size));
+    true
   }
 }
 
@@ -592,5 +674,158 @@ fn mouse_forwarded(mode: MouseProtocolMode, kind: MouseEventKind) -> bool {
       MouseEventKind::Moved => false,
     },
     MouseProtocolMode::AnyMotion => true,
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+
+  use super::*;
+
+  fn winsize(x: u16, y: u16) -> Winsize {
+    Winsize {
+      x,
+      y,
+      x_px: 0,
+      y_px: 0,
+    }
+  }
+
+  fn screen() -> TaskScreen {
+    TaskScreen::new(TaskId(1), SharedVt::new(Screen::new(DEFAULT_SIZE, 0)), 1)
+  }
+
+  fn attach(
+    screen: &mut TaskScreen,
+    size: Winsize,
+  ) -> (
+    ObserverId,
+    UnboundedReceiver<ScreenNotify>,
+    Vec<TaskScreenEffect>,
+  ) {
+    let observer = ObserverId::new();
+    let (sink, rx) = unbounded_channel();
+    let mut effects = Vec::new();
+    screen.handle_cmd(
+      TaskScreenCmd::Attach {
+        observer,
+        size,
+        sink,
+      },
+      &mut effects,
+    );
+    (observer, rx, effects)
+  }
+
+  fn take_notifies(
+    rx: &mut UnboundedReceiver<ScreenNotify>,
+  ) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    loop {
+      match rx.try_recv() {
+        Ok(ScreenNotify::Attached) => out.push("attached"),
+        Ok(ScreenNotify::Render) => out.push("render"),
+        Ok(ScreenNotify::Bell) => out.push("bell"),
+        Ok(ScreenNotify::CopyPresent { .. }) => out.push("copy"),
+        Ok(ScreenNotify::Yank { .. }) => out.push("yank"),
+        Err(_) => break,
+      }
+    }
+    out
+  }
+
+  fn resize_of(effects: &[TaskScreenEffect]) -> Option<(u16, u16)> {
+    effects.iter().find_map(|effect| match effect {
+      TaskScreenEffect::Resize(size) => Some((size.x, size.y)),
+      _ => None,
+    })
+  }
+
+  fn vt_size(screen: &TaskScreen) -> Size {
+    screen.vt().read().unwrap().size()
+  }
+
+  #[test]
+  fn attach_at_default_size_sends_attached_only() {
+    let mut screen = screen();
+    let (_, mut rx, effects) = attach(&mut screen, winsize(80, 24));
+    assert_eq!(take_notifies(&mut rx), ["attached"]);
+    assert!(resize_of(&effects).is_none());
+    assert_eq!(vt_size(&screen), DEFAULT_SIZE);
+  }
+
+  #[test]
+  fn attach_at_other_size_resizes_vt_and_renders() {
+    let mut screen = screen();
+    let (_, mut rx, effects) = attach(&mut screen, winsize(100, 30));
+    assert_eq!(take_notifies(&mut rx), ["attached", "render"]);
+    assert_eq!(resize_of(&effects), Some((100, 30)));
+    assert_eq!(
+      vt_size(&screen),
+      Size {
+        width: 100,
+        height: 30
+      }
+    );
+  }
+
+  #[test]
+  fn resize_notifies_observers_after_geometry_change() {
+    let mut screen = screen();
+    let (observer, mut rx, _) = attach(&mut screen, winsize(80, 24));
+    let _ = take_notifies(&mut rx);
+
+    let mut effects = Vec::new();
+    screen.handle_cmd(
+      TaskScreenCmd::Input {
+        observer,
+        event: TermEvent::Resize(120, 40),
+      },
+      &mut effects,
+    );
+    assert_eq!(take_notifies(&mut rx), ["render"]);
+    assert_eq!(resize_of(&effects), Some((120, 40)));
+    assert_eq!(
+      vt_size(&screen),
+      Size {
+        width: 120,
+        height: 40
+      }
+    );
+  }
+
+  #[test]
+  fn same_size_resize_is_silent() {
+    let mut screen = screen();
+    let (observer, mut rx, _) = attach(&mut screen, winsize(80, 24));
+    let _ = take_notifies(&mut rx);
+
+    let mut effects = Vec::new();
+    screen.handle_cmd(
+      TaskScreenCmd::Input {
+        observer,
+        event: TermEvent::Resize(80, 24),
+      },
+      &mut effects,
+    );
+    assert!(take_notifies(&mut rx).is_empty());
+    assert!(resize_of(&effects).is_none());
+  }
+
+  #[test]
+  fn detach_of_smaller_observer_grows_and_renders() {
+    let mut screen = screen();
+    let (small, mut small_rx, _) = attach(&mut screen, winsize(40, 12));
+    let _ = take_notifies(&mut small_rx);
+    let (_, mut large_rx, _) = attach(&mut screen, winsize(80, 24));
+    // Second attach keeps the min size, so no geometry change.
+    assert_eq!(take_notifies(&mut large_rx), ["attached"]);
+
+    let mut effects = Vec::new();
+    screen.handle_cmd(TaskScreenCmd::Detach { observer: small }, &mut effects);
+    assert_eq!(take_notifies(&mut large_rx), ["render"]);
+    assert_eq!(resize_of(&effects), Some((80, 24)));
+    assert_eq!(vt_size(&screen), DEFAULT_SIZE);
   }
 }

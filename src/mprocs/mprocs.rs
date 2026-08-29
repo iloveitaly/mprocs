@@ -8,13 +8,13 @@ use std::{
 
 use crate::config::hook::watch_idle;
 use crate::console::app::console_task_registration;
-use crate::console::keymap::Keymap;
 #[cfg(unix)]
 use crate::error::ResultLogger;
 use crate::kernel::kernel::Kernel;
 use crate::kernel::kernel_message::TaskSelector;
 use crate::kernel::task::TaskDef;
 use crate::kernel::task_key::TaskSpaceId;
+use crate::kernel::task_path::TaskPath;
 use crate::mprocs::config::{
   CmdConfig, Config, ConfigContext, ProcConfig, ServerConfig, default_stop,
 };
@@ -28,9 +28,9 @@ use crate::mprocs::yaml_val::Val;
 use crate::task::config_tasks::register_config_tasks;
 use crate::{
   attach_client::client_main,
-  console::client::ClientId,
   dekit::server::dispatch_connection,
   protocol::{ConnReceiver, ConnSender},
+  target::Target,
 };
 use anyhow::{Result, bail};
 use clap::{ArgMatches, arg, command};
@@ -78,8 +78,7 @@ pub async fn run_app(args: Vec<String>) -> anyhow::Result<()> {
       .map_err(|e| anyhow::Error::msg(format!("[{}] {}", "local config", e)))?;
   }
 
-  let mut keymap = Keymap::new();
-  settings.add_to_keymap(&mut keymap)?;
+  let keymap = settings.keymap.build();
 
   let mut config = {
     let mut config = if let Some((v, ctx)) = config_value {
@@ -230,15 +229,23 @@ pub async fn run_app(args: Vec<String>) -> anyhow::Result<()> {
       let mut kernel = Kernel::new();
       let pc = kernel.context();
       let server = config.server.take();
-      let config = crate::config::config::Config::from(config);
+      let config =
+        std::sync::Arc::new(crate::config::config::Config::from(config));
       let app_task_id = pc.alloc_id();
-      let (registration, _console_done) = console_task_registration(
+      let registration = console_task_registration(
         app_task_id,
-        TaskDef::default(),
+        TaskDef {
+          space: TaskSpaceId::dekit(),
+          path: Some(TaskPath::new("console").expect("valid console path")),
+          pinned: true,
+          ..TaskDef::default()
+        },
         config.clone(),
         keymap,
       );
-      kernel.register_task_registration(registration);
+      if let Err(err) = kernel.register_task_registration(registration) {
+        bail!("Failed to register console task: {err}");
+      }
       let app_sender = pc.get_task_sender(app_task_id);
 
       if let Some(ServerConfig::Tcp(addr)) = server {
@@ -255,7 +262,7 @@ pub async fn run_app(args: Vec<String>) -> anyhow::Result<()> {
         ));
       }
 
-      tokio::spawn(async {
+      let kernel_handle = tokio::spawn(async {
         kernel.run().await;
         #[cfg(unix)]
         crate::process::unix_processes_waiter::UnixProcessesWaiter::uninit()
@@ -263,31 +270,35 @@ pub async fn run_app(args: Vec<String>) -> anyhow::Result<()> {
       });
 
       if let Some(hook) = config.on_idle.clone() {
-        watch_idle(
-          &pc,
-          TaskSelector::All(TaskSpaceId::default_space()),
-          hook,
-          app_sender.clone(),
-        );
+        watch_idle(&pc, &config, TaskSelector::all(), hook, app_sender.clone());
       }
       register_config_tasks(&config, &pc).await?;
       if let Some(hook) = &config.on_init {
-        hook.run(&pc, &app_sender);
+        hook.run(&pc, &config, &app_sender);
       }
 
       let conn_pc = pc.clone();
+      let conn_config = config.clone();
       tokio::spawn(async move {
         dispatch_connection(
-          ClientId(1),
-          app_sender,
           conn_pc,
+          conn_config,
           srv_to_clt_sender,
           clt_to_srv_receiver,
         )
         .await
       });
 
-      let ret = client_main(clt_to_srv_sender, srv_to_clt_receiver).await;
+      let ret = client_main(
+        "@dekit/console".parse::<Target>().expect("valid target"),
+        clt_to_srv_sender,
+        srv_to_clt_receiver,
+      )
+      .await;
+      // mprocs is foreground: its only client leaving ends the run, and
+      // the tasks must come down in order rather than with the process.
+      pc.send(crate::kernel::kernel_message::KernelCommand::Quit);
+      let _ = kernel_handle.await;
       drop(logger);
       ret
     }

@@ -1,7 +1,6 @@
 pub mod action;
 pub mod app;
 pub mod app_layout;
-pub mod client;
 pub mod keymap;
 pub mod modal;
 pub mod state;

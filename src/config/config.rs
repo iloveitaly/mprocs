@@ -10,24 +10,12 @@ use crate::config::task::{TaskConfig, parse_task_settings, task_from_cfg};
 use crate::config::tui::TuiConfig;
 
 /// Top-level keys allowed in the global (`~/.config/dekit/dekit.yaml`) config.
-const ROOT_KEYS_GLOBAL: &[&str] = &[
-  "log",
-  "defaults",
-  "tui",
-  "keymap",
-  "on_init",
-  "on_idle",
-];
+const ROOT_KEYS_GLOBAL: &[&str] =
+  &["log", "defaults", "tui", "keymap", "on_init", "on_idle"];
 
 /// Top-level keys allowed in a project `dekit.yaml`.
 const ROOT_KEYS_LOCAL: &[&str] = &[
-  "log",
-  "defaults",
-  "tui",
-  "keymap",
-  "on_init",
-  "on_idle",
-  "tasks",
+  "log", "defaults", "tui", "keymap", "on_init", "on_idle", "tasks",
 ];
 
 #[derive(Clone)]

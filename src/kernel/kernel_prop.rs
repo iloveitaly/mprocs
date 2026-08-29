@@ -10,7 +10,7 @@ use proptest::prelude::*;
 
 use super::{Graph, Kernel, SentCmd, TimerRequest};
 use crate::kernel::kernel_message::{
-  KernelCommand, KernelMessage, TaskSelector,
+  KernelCommand, KernelMessage, SpaceSelector, TaskSelector,
 };
 use crate::kernel::sub_trie::SubMode;
 use crate::kernel::task::{
@@ -70,6 +70,7 @@ impl Task for ScriptedTask {
       TaskCmd::Start => self.script.on_start.apply(fx),
       TaskCmd::Stop => self.script.on_stop.apply(fx),
       TaskCmd::Kill => self.script.on_kill.apply(fx),
+      TaskCmd::Duplicate(_) => (),
       TaskCmd::Msg(_) => self.script.on_msg.apply(fx),
     }
   }
@@ -122,8 +123,6 @@ enum Cmd {
   Restart(Sel),
   Down(Sel),
   Veto(Sel),
-  AddEdge(usize, usize),
-  RemoveEdge(usize, usize),
   Register(usize),
   Remove(usize),
   Subscribe(usize, usize),
@@ -205,8 +204,6 @@ fn cmd(n: usize) -> impl Strategy<Value = Cmd> {
     2 => sel(n).prop_map(Cmd::Restart),
     1 => sel(n).prop_map(Cmd::Down),
     1 => sel(n).prop_map(Cmd::Veto),
-    2 => (0..n, 0..n).prop_map(|(a, b)| Cmd::AddEdge(a, b)),
-    1 => (0..n, 0..n).prop_map(|(a, b)| Cmd::RemoveEdge(a, b)),
     2 => (0..n).prop_map(Cmd::Register),
     1 => (0..n).prop_map(Cmd::Remove),
     1 => (0..n, 0..n).prop_map(|(a, b)| Cmd::Subscribe(a, b)),
@@ -270,6 +267,10 @@ impl Run {
     command: KernelCommand,
   ) -> Vec<(TaskId, SentCmd)> {
     let _ = self.kernel.dispatch(KernelMessage { from, command });
+    self.finish_turn()
+  }
+
+  fn finish_turn(&mut self) -> Vec<(TaskId, SentCmd)> {
     self.kernel.graph.settle();
     self.timers.extend(self.kernel.graph.take_timers());
     self.check();
@@ -308,7 +309,11 @@ impl Run {
         ReadyMode::Immediate
       },
       restart: task.restart,
-      deps: task.deps.iter().map(|d| TaskId(d + 1)).collect(),
+      deps: task
+        .deps
+        .iter()
+        .map(|d| TaskSelector::Id(TaskId(d + 1)))
+        .collect(),
       pinned: task.pinned,
       space: TaskSpaceId::default_space(),
       path: Some(TaskPath::new(format!("t{}", i + 1)).unwrap()),
@@ -319,14 +324,16 @@ impl Run {
     let script = task.script;
     // Predicted outcome: refused on a duplicate id or a missing dep.
     let live = |t: &TaskId| self.kernel.graph.tasks.contains_key(t);
-    let expect_ok = !live(&task_id) && def.deps.iter().all(live);
+    let expect_ok =
+      !live(&task_id) && task.deps.iter().all(|d| live(&TaskId(d + 1)));
     let registered = self.kernel.graph.register_task_with_id(
       task_id,
       def,
       Box::new(move |_| Box::new(ScriptedTask { script })),
     );
     assert_eq!(
-      registered, expect_ok,
+      registered.is_ok(),
+      expect_ok,
       "registration outcome for {:?} (dup or missing dep misjudged)",
       task_id
     );
@@ -359,16 +366,16 @@ impl Run {
     let n = world.tasks.len();
     match sel {
       Sel::Id(k) => TaskSelector::Id(TaskId((k % n) + 1)),
-      Sel::All => TaskSelector::All(TaskSpaceId::default_space()),
+      Sel::All => TaskSelector::all(),
       Sel::Exact(k) => TaskSelector::Glob(
-        TaskSpaceId::default_space(),
+        SpaceSelector::default_space(),
         format!("t{}", (k % n) + 1),
       ),
       Sel::Wild => {
-        TaskSelector::Glob(TaskSpaceId::default_space(), "*".to_string())
+        TaskSelector::Glob(SpaceSelector::default_space(), "*".to_string())
       }
       Sel::Tag(even) => TaskSelector::Tag(
-        TaskSpaceId::default_space(),
+        SpaceSelector::default_space(),
         if *even { "even" } else { "odd" }.to_string(),
       ),
     }
@@ -481,29 +488,14 @@ impl Run {
       Cmd::Restart(sel) => self.exec_intent(world, sel, Intent::Restart),
       Cmd::Down(sel) => self.exec_intent(world, sel, Intent::Down),
       Cmd::Veto(sel) => self.exec_intent(world, sel, Intent::Veto),
-      Cmd::AddEdge(a, b) => {
-        self.turn(
-          INIT_TASK_ID,
-          KernelCommand::AddEdge {
-            from: id(*a),
-            to: id(*b),
-          },
-        );
-      }
-      Cmd::RemoveEdge(a, b) => {
-        self.turn(
-          INIT_TASK_ID,
-          KernelCommand::RemoveEdge {
-            from: id(*a),
-            to: id(*b),
-          },
-        );
-      }
       Cmd::Register(k) => self.register(world, k % n),
       Cmd::Remove(t) => {
         let t = id(*t);
         self.epochs.remove(&t);
-        self.turn(INIT_TASK_ID, KernelCommand::RemoveTask(t));
+        self.turn(
+          INIT_TASK_ID,
+          KernelCommand::Remove(TaskSelector::Id(t), None),
+        );
       }
       Cmd::Subscribe(a, b) => {
         let path = TaskPath::new(format!("t{}", (b % n) + 1)).unwrap();

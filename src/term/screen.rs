@@ -250,6 +250,16 @@ impl Screen {
     self.mode(MODE_HIDE_CURSOR)
   }
 
+  /// For a task that draws into the screen directly instead of feeding
+  /// it terminal output.
+  pub fn set_hide_cursor(&mut self, hide: bool) {
+    if hide {
+      self.set_mode(MODE_HIDE_CURSOR);
+    } else {
+      self.clear_mode(MODE_HIDE_CURSOR);
+    }
+  }
+
   /// Returns the currently active `MouseProtocolMode`
   #[must_use]
   pub fn mouse_protocol_mode(&self) -> MouseProtocolMode {
@@ -881,8 +891,7 @@ impl Screen {
         self.kitty_flags.truncate(len);
       }
       (b'=', 0, b'u') => {
-        let flags =
-          (p.get(0, 0) & KITTY_KEYBOARD_SUPPORTED_FLAGS as u32) as u8;
+        let flags = (p.get(0, 0) & KITTY_KEYBOARD_SUPPORTED_FLAGS as u32) as u8;
         if self.kitty_flags.is_empty() {
           self.kitty_flags.push(0);
         }

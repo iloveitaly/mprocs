@@ -212,7 +212,6 @@ impl Process for UnixProcess {
 mod tests {
   use std::time::{Duration, Instant};
 
-  use crate::process::process::Process as _;
   use crate::process::process_spec::ProcessSpec;
   use crate::term::Winsize;
 

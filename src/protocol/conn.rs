@@ -193,6 +193,7 @@ mod tests {
   use super::*;
   use crate::protocol::ctl::{Request, RpcError};
   use crate::protocol::rpc::RpcRequest;
+  use crate::target::Target;
 
   fn pair() -> (ConnSender, ConnReceiver, ConnSender, ConnReceiver) {
     let (client, server) = tokio::io::duplex(64 * 1024);
@@ -250,6 +251,7 @@ mod tests {
       );
     cs.send_ctl(CtlMsg::Hello(Hello {
       protocol: 999,
+      version: "99.0.0".to_string(),
       app: "dekit future".to_string(),
       features: vec![],
     }))
@@ -274,6 +276,7 @@ mod tests {
       }
       ss.send_ctl(CtlMsg::Hello(Hello {
         protocol: 999,
+        version: "99.0.0".to_string(),
         app: "dekit future".to_string(),
         features: vec![],
       }))
@@ -296,16 +299,16 @@ mod tests {
       let req = RpcRequest::from_wire(&request.method, request.params).unwrap();
       assert_eq!(
         req,
-        RpcRequest::Start {
-          pattern: "/web".to_string()
+        RpcRequest::Why {
+          target: Target::glob("web")
         }
       );
       ss.send_ctl(CtlMsg::ok(request.id, serde_json::json!({})))
         .await
         .unwrap();
     });
-    let (method, params) = RpcRequest::Start {
-      pattern: "/web".to_string(),
+    let (method, params) = RpcRequest::Why {
+      target: Target::glob("web"),
     }
     .to_wire();
     cs.send_ctl(CtlMsg::Request(Request {

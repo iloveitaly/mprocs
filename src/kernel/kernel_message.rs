@@ -1,6 +1,6 @@
 use std::{
   any::Any,
-  fmt::Debug,
+  fmt::{self, Debug},
   ops::Deref,
   sync::{Arc, RwLock, atomic::AtomicUsize},
 };
@@ -46,37 +46,35 @@ impl TaskRegistration {
   }
 }
 
+pub type Ack = Option<tokio::sync::oneshot::Sender<usize>>;
+
 pub enum KernelCommand {
   Quit,
 
-  RegisterTask(TaskRegistration, tokio::sync::oneshot::Sender<bool>),
-  /// Total: removes a task in any state, killing it if it is running.
-  RemoveTask(TaskId),
+  /// Registration is atomic: deps are resolved, the path claimed, and the
+  /// task inserted in one dispatch, or nothing happens.
+  RegisterTask(
+    TaskRegistration,
+    tokio::sync::oneshot::Sender<Result<(), RegisterError>>,
+  ),
 
-  /// Intent commands resolve the selector and act on the matches in the
+  /// Selector commands resolve the selector and act on the matches in the
   /// same dispatch, so no other message can interleave between the two.
   /// The ack is answered in that dispatch with the matched-task count.
-  Start(TaskSelector, Option<tokio::sync::oneshot::Sender<usize>>),
-  Stop(TaskSelector, Option<tokio::sync::oneshot::Sender<usize>>),
-  Kill(TaskSelector, Option<tokio::sync::oneshot::Sender<usize>>),
-  Restart(TaskSelector, Option<tokio::sync::oneshot::Sender<usize>>),
-  ForceRestart(TaskSelector, Option<tokio::sync::oneshot::Sender<usize>>),
-  Down(TaskSelector, Option<tokio::sync::oneshot::Sender<usize>>),
-  Veto(TaskSelector, Option<tokio::sync::oneshot::Sender<usize>>),
-  /// `from` requires `to`.
-  AddEdge {
-    from: TaskId,
-    to: TaskId,
-  },
-  RemoveEdge {
-    from: TaskId,
-    to: TaskId,
-  },
+  Start(TaskSelector, Ack),
+  Stop(TaskSelector, Ack),
+  Kill(TaskSelector, Ack),
+  Restart(TaskSelector, Ack),
+  ForceRestart(TaskSelector, Ack),
+  Down(TaskSelector, Ack),
+  Veto(TaskSelector, Ack),
+  /// Total: removes matching tasks in any state, killing running ones.
+  Remove(TaskSelector, Ack),
+  SetLabel(TaskSelector, Option<String>, Ack),
+  /// Asks each matching task to register a copy of itself.
+  Duplicate(TaskSelector, Option<String>, Ack),
 
   TaskMsg(TaskId, Box<dyn Any + Send>),
-
-  SetTaskPath(TaskId, TaskPath),
-  SetTaskLabel(TaskId, Option<String>),
 
   Query(
     KernelQuery,
@@ -100,36 +98,92 @@ pub enum KernelCommand {
   StateTimeout(TaskId, u64),
 }
 
-#[derive(Clone, Debug)]
-pub enum TaskSelector {
-  Id(TaskId),
-  /// Every task with a path.
-  All(TaskSpaceId),
-  Glob(TaskSpaceId, String),
-  /// Tasks carrying the tag.
-  Tag(TaskSpaceId, String),
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum SpaceSelector {
+  One(TaskSpaceId),
+  Any,
 }
 
+impl SpaceSelector {
+  pub fn default_space() -> Self {
+    SpaceSelector::One(TaskSpaceId::default_space())
+  }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TaskSelector {
+  Id(TaskId),
+  /// Tasks whose path matches the glob; `**` is every task with a path.
+  Glob(SpaceSelector, String),
+  /// Tasks carrying the tag.
+  Tag(SpaceSelector, String),
+}
+
+impl TaskSelector {
+  pub fn all() -> Self {
+    TaskSelector::Glob(SpaceSelector::default_space(), "**".to_string())
+  }
+}
+
+impl fmt::Display for TaskSelector {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let space = |f: &mut fmt::Formatter<'_>, space: &SpaceSelector| match space
+    {
+      SpaceSelector::One(space) if space.is_default() => Ok(()),
+      SpaceSelector::One(space) => write!(f, "@{}/", space),
+      SpaceSelector::Any => f.write_str("@*/"),
+    };
+    match self {
+      TaskSelector::Id(id) => write!(f, "{{id: {}}}", id.0),
+      TaskSelector::Glob(s, pattern) => {
+        space(f, s)?;
+        f.write_str(pattern)
+      }
+      TaskSelector::Tag(s, tag) => {
+        space(f, s)?;
+        write!(f, "+{}", tag)
+      }
+    }
+  }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RegisterError {
+  IdTaken,
+  ReservedSpace(TaskSpaceId),
+  PathTaken(TaskKey),
+  /// A dep selector matched no task.
+  MissingDep(TaskSelector),
+}
+
+impl fmt::Display for RegisterError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      RegisterError::IdTaken => f.write_str("task id is already registered"),
+      RegisterError::ReservedSpace(space) => {
+        write!(f, "space '@{}' is reserved", space)
+      }
+      RegisterError::PathTaken(key) => {
+        write!(f, "a task already exists at '{}'", key)
+      }
+      RegisterError::MissingDep(selector) => {
+        write!(f, "dep '{}' matches no task", selector)
+      }
+    }
+  }
+}
+
+impl std::error::Error for RegisterError {}
+
 pub enum KernelQuery {
-  /// List tasks matching an optional glob. None = list all.
-  ListTasks(TaskSpaceId, Option<String>),
-  /// Resolve a path to a TaskId.
-  ResolvePath(TaskKey),
-  /// List the task ids carrying a tag.
-  TasksWithTag(TaskSpaceId, String),
-  /// Get the current screen content for a task (rendered as ANSI text).
-  GetScreen(TaskKey),
-  /// Explain why a task is (not) running.
-  Explain(TaskKey),
+  ListTasks(TaskSelector),
+  /// Explain why matching tasks are (not) running.
+  Explain(TaskSelector),
 }
 
 pub enum KernelQueryResponse {
   TaskList(Vec<TaskInfo>),
-  ResolvedPath(Option<TaskId>),
-  TaggedTasks(Vec<TaskId>),
-  /// ANSI-rendered screen content, or None if the task has no screen.
-  Screen(Option<String>),
-  Explain(Option<TaskExplain>),
+  Explain(Vec<TaskExplain>),
 }
 
 #[derive(Clone, Debug)]
@@ -142,8 +196,28 @@ pub struct TaskInfo {
   pub vt: Option<SharedVt>,
 }
 
+impl TaskInfo {
+  /// `@space/path`, or `<task:id>` for a task without a path.
+  pub fn name(&self) -> String {
+    task_name(self.id, &self.space, self.path.as_ref())
+  }
+}
+
+pub fn task_name(
+  id: TaskId,
+  space: &TaskSpaceId,
+  path: Option<&TaskPath>,
+) -> String {
+  match path {
+    Some(path) => TaskKey::new(space.clone(), path.clone()).to_string(),
+    None => format!("<task:{}>", id.0),
+  }
+}
+
 #[derive(Clone, Debug)]
 pub struct TaskExplain {
+  pub id: TaskId,
+  pub name: String,
   pub state: TaskState,
   pub wanted: bool,
   /// Wanted and every dependency transitively supported and satisfied;
@@ -270,13 +344,12 @@ impl TaskContext {
     task_id
   }
 
-  /// The returned ack resolves to whether the task was registered.
   pub fn spawn_async_with_id<F, Fut>(
     &self,
     task_id: TaskId,
     def: TaskDef,
     f: F,
-  ) -> tokio::sync::oneshot::Receiver<bool>
+  ) -> tokio::sync::oneshot::Receiver<Result<(), RegisterError>>
   where
     F: FnOnce(TaskContext, tokio::sync::mpsc::UnboundedReceiver<TaskCmd>) -> Fut
       + Send
@@ -290,18 +363,10 @@ impl TaskContext {
   pub fn register_task(
     &self,
     registration: TaskRegistration,
-  ) -> tokio::sync::oneshot::Receiver<bool> {
+  ) -> tokio::sync::oneshot::Receiver<Result<(), RegisterError>> {
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     self.send(KernelCommand::RegisterTask(registration, ack_tx));
     ack_rx
-  }
-
-  pub fn set_task_path(&self, task_id: TaskId, path: TaskPath) {
-    self.send(KernelCommand::SetTaskPath(task_id, path));
-  }
-
-  pub fn set_task_label(&self, task_id: TaskId, label: Option<String>) {
-    self.send(KernelCommand::SetTaskLabel(task_id, label));
   }
 
   pub fn subscribe_path(&self, key: TaskKey, mode: SubMode) {
