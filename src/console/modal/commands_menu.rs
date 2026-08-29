@@ -1,439 +1,282 @@
-use std::collections::HashMap;
-
 use tui_input::Input;
 
 use crate::console::action::{Action, ScrollUnit};
 use crate::console::{
-  app::LoopAction,
-  keymap::Keymap,
-  state::State,
+  client::ClientId,
+  keymap::{Keymap, KeymapGroup},
   widgets::{
     list::ListState,
     text_input::{render_text_input, to_input_request},
   },
 };
-use crate::kernel::kernel_message::TaskContext;
 use crate::term::{
-  Color, Grid, TermEvent,
+  Color, CursorStyle, Grid,
   attrs::Attrs,
-  grid::{BorderType, Pos, Rect},
+  grid::{BorderType, Rect},
   key::{Key, KeyCode, KeyMods},
   line_symbols::{HORIZONTAL, VERTICAL_LEFT, VERTICAL_RIGHT},
 };
 
-use super::modal::Modal;
+use super::modal::{Modal, ModalResult};
 
 pub struct CommandsMenuModal {
-  pc: TaskContext,
   input: Input,
-  list_state: ListState,
-  items: Vec<CommandInfo>,
-  key_bindings: HashMap<Action, String>,
+  list: ListState,
+  items: Vec<MenuItem>,
+}
+
+struct MenuItem {
+  name: String,
+  desc: String,
+  action: Action,
 }
 
 impl CommandsMenuModal {
-  pub fn new(pc: TaskContext, keymap: &Keymap) -> Self {
-    let mut key_bindings = HashMap::new();
-    for (event, key) in &keymap.rev_tasks {
-      key_bindings
-        .entry(event.clone())
-        .or_insert_with(|| key.to_string());
-    }
-
+  pub fn new() -> Self {
     CommandsMenuModal {
-      pc,
       input: Input::default(),
-      list_state: ListState::default(),
-      items: get_commands(""),
-      key_bindings,
+      list: ListState::default(),
+      items: menu_items(""),
     }
   }
 }
 
 impl Modal for CommandsMenuModal {
-  fn handle_input(
-    &mut self,
-    _state: &mut State,
-    loop_action: &mut LoopAction,
-    event: &TermEvent,
-  ) -> bool {
-    match event {
-      TermEvent::Key(Key {
-        code: KeyCode::Enter,
-        mods,
-        ..
-      }) if mods.is_empty() => {
-        self.pc.send_self_custom(Action::CloseCurrentModal);
-        if let Some(item) = self.items.get(self.list_state.selected()) {
-          self.pc.send_self_custom(item.event.clone());
-        }
-        // Skip because AddTask event will immediately rerender.
-        return true;
+  fn handle_key(&mut self, key: &Key, _client_id: ClientId) -> ModalResult {
+    let count = self.items.len();
+    match (key.code, key.mods) {
+      (KeyCode::Enter, KeyMods::NONE) => {
+        return match self.items.get(self.list.selected()) {
+          Some(item) => ModalResult::Run(item.action.clone()),
+          None => ModalResult::Close,
+        };
       }
-      TermEvent::Key(Key {
-        code: KeyCode::Esc,
-        mods,
-        ..
-      }) if mods.is_empty() => {
-        self.pc.send_self_custom(Action::CloseCurrentModal);
-        loop_action.render();
-        return true;
-      }
-      // List navigation
-      TermEvent::Key(Key { code, mods, .. })
-        if (code == &KeyCode::Up && mods.is_empty())
-          || (code == &KeyCode::Char('p') && mods == &KeyMods::CONTROL) =>
-      {
-        if !self.items.is_empty() {
-          let index = self.list_state.selected();
-          let index = if index == 0 {
-            self.items.len() - 1
-          } else {
-            index - 1
-          };
-          self.list_state.select(index);
-          loop_action.render();
+      (KeyCode::Esc, KeyMods::NONE) => return ModalResult::Close,
+      (KeyCode::Up, KeyMods::NONE) | (KeyCode::Char('p'), KeyMods::CONTROL) => {
+        if count > 0 {
+          self.list.select((self.list.selected() + count - 1) % count, count);
         }
-        return true;
+        return ModalResult::Keep;
       }
-      TermEvent::Key(Key { code, mods, .. })
-        if (code == &KeyCode::Down && mods.is_empty())
-          || (code == &KeyCode::Char('n') && mods == &KeyMods::CONTROL) =>
-      {
-        if !self.items.is_empty() {
-          let index = self.list_state.selected();
-          let index = if index >= self.items.len() - 1 {
-            0
-          } else {
-            index + 1
-          };
-          self.list_state.select(index);
-          loop_action.render();
+      (KeyCode::Down, KeyMods::NONE)
+      | (KeyCode::Char('n'), KeyMods::CONTROL) => {
+        if count > 0 {
+          self.list.select((self.list.selected() + 1) % count, count);
         }
-        return true;
+        return ModalResult::Keep;
       }
       _ => (),
     }
-
-    let req = to_input_request(event);
-    if let Some(req) = req {
-      let res = self.input.handle(req);
-      if let Some(res) = res {
-        if res.value {
-          self.items = get_commands(self.input.value());
-        }
-      }
-      loop_action.render();
-      return true;
+    if let Some(req) = to_input_request(key)
+      && self.input.handle(req).is_some_and(|change| change.value)
+    {
+      self.items = menu_items(&self.input.value().to_lowercase());
     }
-
-    match event {
-      TermEvent::FocusGained => false,
-      TermEvent::FocusLost => false,
-      // Block keys
-      TermEvent::Key(_) => true,
-      // Block mouse
-      TermEvent::Mouse(_) => true,
-      // Block paste
-      TermEvent::Paste(_) => true,
-      TermEvent::Resize(_, _) => false,
-    }
+    ModalResult::Keep
   }
 
-  fn get_size(&mut self, _: Rect) -> (u16, u16) {
+  fn size(&self) -> (u16, u16) {
     (60, 30)
   }
 
-  fn render(&mut self, grid: &mut Grid) {
-    let area = self.area(Rect {
-      x: 0,
-      y: 0,
-      width: grid.size().width,
-      height: grid.size().height,
-    });
-
-    grid.draw_block(
-      area.into(),
-      &BorderType::Rounded.chars(),
-      Attrs::default(),
-    );
-
+  fn render(&mut self, grid: &mut Grid, keymap: &Keymap) {
+    let area = self.area(grid.area());
     let inner = area.inner(1);
-
-    // Fill inner
-    grid.fill_area(inner.into(), ' ', Attrs::default());
-
-    // Title
-    let title = " Commands ";
-    let title_attrs = Attrs::default().set_bold(true);
+    grid.draw_block(area, &BorderType::Rounded.chars(), Attrs::default());
+    grid.fill_area(inner, ' ', Attrs::default());
     grid.draw_text(
-      Rect::new(area.x + 2, area.y, inner.x + 1, 1),
-      title,
-      title_attrs,
+      Rect::new(area.x + 2, area.y, inner.width, 1),
+      " Commands ",
+      Attrs::default().set_bold(true),
     );
 
-    let list_area = Rect {
-      x: inner.x,
-      y: inner.y + 2,
-      width: inner.width,
-      height: inner.height.saturating_sub(2),
-    };
-    let sep_y = inner.y + 1;
+    let (top, list_area) = inner.split_h(2);
+    let (input_row, sep_row) = top.split_h(1);
+    self.list.fit(list_area, self.items.len());
 
-    self.list_state.fit(list_area, self.items.len());
-
-    let desc_col = 22u16;
-
-    // "/ "
-    grid.draw_text(
-      Rect::new(inner.x, inner.y, 2, 1),
-      "/ ",
-      Attrs::default().fg(Color::YELLOW),
-    );
-
-    // Counter (selected/total)
-    let total = self.items.len();
-    let counter_width = if total > 0 {
-      let counter_text =
-        format!("{}/{}", self.list_state.selected() + 1, total);
-      let counter_width = counter_text.len() as u16;
-      grid
-        .draw_text(
-          Rect::new(
-            inner.x + inner.width.saturating_sub(counter_width),
-            inner.y,
-            counter_width,
-            1,
-          ),
-          &counter_text,
-          Attrs::default().fg(Color::BRIGHT_BLACK),
-        )
-        .width
+    // Input row: "/ <input>   selected/total"
+    let counter = if self.items.is_empty() {
+      String::new()
     } else {
-      0
+      format!("{}/{}", self.list.selected() + 1, self.items.len())
     };
-
-    // Input
+    let counter_width = counter.len() as u16;
+    grid.draw_text(
+      Rect::new(
+        input_row.right().saturating_sub(counter_width),
+        input_row.y,
+        counter_width,
+        1,
+      ),
+      &counter,
+      Attrs::default().fg(Color::BRIGHT_BLACK),
+    );
+    grid.draw_text(input_row, "/ ", Attrs::default().fg(Color::YELLOW));
     let input_area = Rect::new(
-      inner.x + 2,
-      inner.y,
-      inner.width.saturating_sub(2 + counter_width + 1),
+      input_row.x + 2,
+      input_row.y,
+      input_row.width.saturating_sub(3 + counter_width),
       1,
     );
-    let mut cursor = (0u16, 0u16);
-    render_text_input(&mut self.input, input_area, grid, &mut cursor);
+    grid.cursor_pos = Some(render_text_input(&self.input, input_area, grid));
+    grid.cursor_style = CursorStyle::BlinkingBar;
 
     // Separator
     grid.draw_text(
-      Rect::new(area.x, sep_y, 1, 1),
+      Rect::new(area.x, sep_row.y, 1, 1),
       VERTICAL_RIGHT,
       Attrs::default(),
     );
     grid.draw_text(
-      Rect::new(area.x + area.width - 1, sep_y, 1, 1),
+      Rect::new(area.right() - 1, sep_row.y, 1, 1),
       VERTICAL_LEFT,
       Attrs::default(),
     );
     grid.draw_text(
-      Rect::new(inner.x, sep_y, inner.width, 1),
-      HORIZONTAL.repeat(inner.width as usize).as_str(),
+      sep_row,
+      &HORIZONTAL.repeat(sep_row.width as usize),
       Attrs::default(),
     );
 
     // List
-    let selected_bg = Color::Rgb(100, 100, 100);
     let search = self.input.value().to_lowercase();
-    let range = self.list_state.visible_range();
-    for (row, i) in range.enumerate() {
+    for (row, i) in self.list.visible_range().enumerate() {
       let item = &self.items[i];
-      let selected = self.list_state.selected() == i;
-
-      let row_y = list_area.y + row as u16;
-      let row_rect = Rect::new(list_area.x, row_y, list_area.width, 1);
-
-      if selected {
-        grid.fill_area(row_rect, ' ', Attrs::default().bg(selected_bg));
-
-        // Accent bar on left edge
-        grid.draw_text(
-          Rect::new(list_area.x, row_y, 1, 1),
-          "\u{258e}", // ▎
-          Attrs::default().fg(Color::YELLOW).bg(selected_bg),
-        );
+      let Some(row_rect) = list_area.row(row as u16) else {
+        break;
+      };
+      let bg = if self.list.selected() == i {
+        Color::Rgb(100, 100, 100)
+      } else {
+        Color::Default
+      };
+      let base = Attrs::default().bg(bg);
+      let hl = Attrs::default().bg(bg).fg(Color::YELLOW);
+      if self.list.selected() == i {
+        grid.fill_area(row_rect, ' ', base);
+        grid.draw_text(row_rect, "\u{258e}", hl);
       }
 
-      let name_attrs = if selected {
-        Attrs::default().bg(selected_bg).set_bold(true)
-      } else {
-        Attrs::default()
-      };
-      let name_hl = if selected {
-        Attrs::default()
-          .fg(Color::YELLOW)
-          .bg(selected_bg)
-          .set_bold(true)
-      } else {
-        Attrs::default().fg(Color::YELLOW).set_bold(true)
-      };
-
-      // Description attrs
-      let desc_attrs = if selected {
-        Attrs::default()
-          .fg(Color::Rgb(170, 170, 170))
-          .bg(selected_bg)
-      } else {
-        Attrs::default().fg(Color::Rgb(150, 150, 150))
-      };
-      let desc_hl = if selected {
-        Attrs::default().fg(Color::YELLOW).bg(selected_bg)
-      } else {
-        Attrs::default().fg(Color::YELLOW)
-      };
-
-      let key_attrs = if selected {
-        Attrs::default().fg(Color::YELLOW).bg(selected_bg)
-      } else {
-        Attrs::default().fg(Color::YELLOW)
-      };
-
-      // Column 1: Command
-      draw_highlighted_text(
+      let name = Rect::new(row_rect.x + 2, row_rect.y, 20, 1);
+      draw_highlighted(
         grid,
-        list_area.x + 2,
-        row_y,
-        item.cmd,
+        name,
+        &item.name,
         &search,
-        name_attrs,
-        name_hl,
+        Attrs::default().bg(bg).set_bold(true),
+        Attrs::default().bg(bg).fg(Color::YELLOW).set_bold(true),
+      );
+      let desc = Rect::new(
+        row_rect.x + 22,
+        row_rect.y,
+        row_rect.width.saturating_sub(22),
+        1,
+      );
+      draw_highlighted(
+        grid,
+        desc,
+        &item.desc,
+        &search,
+        Attrs::default().bg(bg).fg(Color::Rgb(160, 160, 160)),
+        hl,
       );
 
-      // Column 2: Description
-      let desc_x = list_area.x + desc_col;
-      draw_highlighted_text(
-        grid, desc_x, row_y, &item.desc, &search, desc_attrs, desc_hl,
-      );
-
-      // Column 3: Key
-      if let Some(binding) = self.key_bindings.get(&item.event) {
-        let binding_width = binding.len() as u16;
-        let bind_x = list_area.right().saturating_sub(binding_width + 1);
+      if let Some(key) = keymap.key(KeymapGroup::Tasks, &item.action) {
+        let key = key.to_string();
+        let width = key.len() as u16;
         grid.draw_text(
-          Rect::new(bind_x, row_y, binding_width, 1),
-          binding,
-          key_attrs,
+          Rect::new(
+            row_rect.right().saturating_sub(width + 1),
+            row_rect.y,
+            width,
+            1,
+          ),
+          &key,
+          hl,
         );
       }
     }
-
-    grid.cursor_pos = Some(Pos {
-      col: cursor.0,
-      row: cursor.1,
-    });
-    grid.cursor_style = crate::term::CursorStyle::BlinkingBar;
   }
 }
 
-fn draw_highlighted_text(
+fn draw_highlighted(
   grid: &mut Grid,
-  start_x: u16,
-  y: u16,
+  mut area: Rect,
   text: &str,
   search: &str,
-  base_attrs: Attrs,
-  highlight_attrs: Attrs,
-) -> u16 {
-  let max_w = 200u16;
+  base: Attrs,
+  hl: Attrs,
+) {
+  let mut draw = |area: &mut Rect, s: &str, attrs: Attrs| {
+    let r = grid.draw_text(*area, s, attrs);
+    *area = area.move_left(r.width as i32);
+  };
   if search.is_empty() {
-    let r = grid.draw_text(Rect::new(start_x, y, max_w, 1), text, base_attrs);
-    return start_x + r.width;
+    draw(&mut area, text, base);
+    return;
   }
-
-  let text_lower = text.to_lowercase();
-  let mut x = start_x;
-  let mut last_end = 0usize;
-
-  for (match_start, _) in text_lower.match_indices(search) {
-    let match_end = match_start + search.len();
-
-    if match_start > last_end {
-      let segment = &text[last_end..match_start];
-      let r = grid.draw_text(Rect::new(x, y, max_w, 1), segment, base_attrs);
-      x += r.width;
+  let lower = text.to_lowercase();
+  let mut last = 0;
+  for (start, _) in lower.match_indices(search) {
+    let end = start + search.len();
+    if start < last
+      || !text.is_char_boundary(start)
+      || !text.is_char_boundary(end)
+    {
+      continue;
     }
-
-    let matched = &text[match_start..match_end];
-    let r = grid.draw_text(Rect::new(x, y, max_w, 1), matched, highlight_attrs);
-    x += r.width;
-
-    last_end = match_end;
+    draw(&mut area, &text[last..start], base);
+    draw(&mut area, &text[start..end], hl);
+    last = end;
   }
-
-  if last_end < text.len() {
-    let segment = &text[last_end..];
-    let r = grid.draw_text(Rect::new(x, y, max_w, 1), segment, base_attrs);
-    x += r.width;
-  }
-
-  x
+  draw(&mut area, &text[last..], base);
 }
 
-struct CommandInfo {
-  cmd: &'static str,
-  desc: String,
-  event: Action,
-}
-
-fn get_commands(search: &str) -> Vec<CommandInfo> {
-  let events = [
-    // ("quit-or-ask", Action::QuitOrAsk),
-    ("quit", Action::Quit),
-    ("force-quit", Action::ForceQuit),
-    ("toggle-focus", Action::ToggleFocus),
-    ("focus-term", Action::FocusTerm),
-    ("zoom", Action::Zoom),
-    ("show-commands-menu", Action::ShowCommandsMenu),
-    ("next-task", Action::NextTask),
-    ("prev-task", Action::PrevTask),
-    ("start-task", Action::StartTask),
-    ("stop-task", Action::StopTask),
-    ("kill-task", Action::KillTask),
-    ("veto-task", Action::VetoTask),
-    ("restart-task", Action::RestartTask),
-    ("restart-all", Action::RestartAll),
-    ("duplicate-task", Action::DuplicateTask),
-    ("force-restart-task", Action::ForceRestartTask),
-    ("force-restart-all", Action::ForceRestartAll),
-    ("show-add-task", Action::ShowAddTask),
-    ("show-rename-task", Action::ShowRenameTask),
-    ("show-remove-task", Action::ShowRemoveTask),
-    ("close-current-modal", Action::CloseCurrentModal),
-    (
-      "scroll-down",
-      Action::ScrollDown {
-        n: 1,
-        unit: ScrollUnit::HalfScreen,
-      },
-    ),
-    (
-      "scroll-up",
-      Action::ScrollUp {
-        n: 1,
-        unit: ScrollUnit::HalfScreen,
-      },
-    ),
-    ("copy-mode-enter", Action::CopyModeEnter),
-    ("copy-mode-leave", Action::CopyModeLeave),
-    ("copy-mode-end", Action::CopyModeEnd),
-    ("copy-mode-copy", Action::CopyModeCopy),
+fn menu_items(search: &str) -> Vec<MenuItem> {
+  let actions = [
+    Action::Quit,
+    Action::ForceQuit,
+    Action::ToggleFocus,
+    Action::FocusTerm,
+    Action::Zoom,
+    Action::ShowCommandsMenu,
+    Action::NextTask,
+    Action::PrevTask,
+    Action::StartTask,
+    Action::StopTask,
+    Action::KillTask,
+    Action::VetoTask,
+    Action::RestartTask,
+    Action::RestartAll,
+    Action::DuplicateTask,
+    Action::ForceRestartTask,
+    Action::ForceRestartAll,
+    Action::ShowAddTask,
+    Action::ShowRenameTask,
+    Action::ShowRemoveTask,
+    Action::CloseCurrentModal,
+    Action::ScrollDown {
+      n: 1,
+      unit: ScrollUnit::HalfScreen,
+    },
+    Action::ScrollUp {
+      n: 1,
+      unit: ScrollUnit::HalfScreen,
+    },
+    Action::CopyModeEnter,
+    Action::CopyModeLeave,
+    Action::CopyModeEnd,
+    Action::CopyModeCopy,
   ];
-
-  let mut result = Vec::new();
-  for (cmd, event) in events {
-    let desc = event.desc();
-    if cmd.contains(search) || desc.contains(search) {
-      result.push(CommandInfo { cmd, desc, event });
-    }
-  }
-
-  result
+  actions
+    .into_iter()
+    .map(|action| MenuItem {
+      name: action.name(),
+      desc: action.desc(),
+      action,
+    })
+    .filter(|item| {
+      item.name.contains(search) || item.desc.to_lowercase().contains(search)
+    })
+    .collect()
 }

@@ -1,5 +1,3 @@
-pub mod view;
-
 use anyhow::bail;
 
 use crate::cfg::{CfgCx, CfgNode, FromCfg};

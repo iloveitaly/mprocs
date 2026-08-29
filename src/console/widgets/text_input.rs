@@ -1,18 +1,14 @@
 use tui_input::{Input, InputRequest};
 
 use crate::term::{
-  Grid, TermEvent,
+  Grid,
   attrs::Attrs,
-  grid::Rect,
-  key::{Key, KeyCode, KeyEventKind, KeyMods},
+  grid::{Pos, Rect},
+  key::{Key, KeyCode, KeyMods},
 };
 
-pub fn render_text_input(
-  input: &mut Input,
-  area: Rect,
-  grid: &mut Grid,
-  cursor_pos: &mut (u16, u16),
-) {
+/// Draws the input and returns the cursor position.
+pub fn render_text_input(input: &Input, area: Rect, grid: &mut Grid) -> Pos {
   let value = input.value();
 
   let left_trim = input.cursor().saturating_sub(area.width as usize);
@@ -29,55 +25,39 @@ pub fn render_text_input(
   grid.fill_area(area, ' ', Attrs::default());
   grid.draw_text(area, value, Attrs::default());
 
-  *cursor_pos = (area.x + cursor as u16, area.y);
+  Pos {
+    col: area.x + cursor as u16,
+    row: area.y,
+  }
 }
 
-pub fn to_input_request(evt: &TermEvent) -> Option<InputRequest> {
+pub fn to_input_request(key: &Key) -> Option<InputRequest> {
   use InputRequest::*;
   use KeyCode::*;
-  match evt {
-    TermEvent::Key(Key {
-      code,
-      mods,
-      kind,
-      state: _,
-    }) if *kind == KeyEventKind::Press || *kind == KeyEventKind::Repeat => {
-      match (*code, *mods) {
-        (Backspace, KeyMods::NONE) | (Char('h'), KeyMods::CONTROL) => {
-          Some(DeletePrevChar)
-        }
-        (Delete, KeyMods::NONE) => Some(DeleteNextChar),
-        (Tab, KeyMods::NONE) => None,
-        (Left, KeyMods::NONE) | (Char('b'), KeyMods::CONTROL) => {
-          Some(GoToPrevChar)
-        }
-        (Left, KeyMods::CONTROL) | (Char('b'), KeyMods::META) => {
-          Some(GoToPrevWord)
-        }
-        (Right, KeyMods::NONE) | (Char('f'), KeyMods::CONTROL) => {
-          Some(GoToNextChar)
-        }
-        (Right, KeyMods::CONTROL) | (Char('f'), KeyMods::META) => {
-          Some(GoToNextWord)
-        }
-        (Char('u'), KeyMods::CONTROL) => Some(DeleteLine),
-
-        (Char('w'), KeyMods::CONTROL)
-        | (Char('d'), KeyMods::META)
-        | (Backspace, KeyMods::META)
-        | (Backspace, KeyMods::ALT) => Some(DeletePrevWord),
-
-        (Delete, KeyMods::CONTROL) => Some(DeleteNextWord),
-        (Char('k'), KeyMods::CONTROL) => Some(DeleteTillEnd),
-        (Char('a'), KeyMods::CONTROL) | (Home, KeyMods::NONE) => {
-          Some(GoToStart)
-        }
-        (Char('e'), KeyMods::CONTROL) | (End, KeyMods::NONE) => Some(GoToEnd),
-        (Char(c), KeyMods::NONE) => Some(InsertChar(c)),
-        (Char(c), KeyMods::SHIFT) => Some(InsertChar(c)),
-        (_, _) => None,
-      }
+  match (key.code, key.mods) {
+    (Backspace, KeyMods::NONE) | (Char('h'), KeyMods::CONTROL) => {
+      Some(DeletePrevChar)
     }
-    _ => None,
+    (Delete, KeyMods::NONE) => Some(DeleteNextChar),
+    (Tab, KeyMods::NONE) => None,
+    (Left, KeyMods::NONE) | (Char('b'), KeyMods::CONTROL) => Some(GoToPrevChar),
+    (Left, KeyMods::CONTROL) | (Char('b'), KeyMods::META) => Some(GoToPrevWord),
+    (Right, KeyMods::NONE) | (Char('f'), KeyMods::CONTROL) => {
+      Some(GoToNextChar)
+    }
+    (Right, KeyMods::CONTROL) | (Char('f'), KeyMods::META) => {
+      Some(GoToNextWord)
+    }
+    (Char('u'), KeyMods::CONTROL) => Some(DeleteLine),
+    (Char('w'), KeyMods::CONTROL)
+    | (Char('d'), KeyMods::META)
+    | (Backspace, KeyMods::META)
+    | (Backspace, KeyMods::ALT) => Some(DeletePrevWord),
+    (Delete, KeyMods::CONTROL) => Some(DeleteNextWord),
+    (Char('k'), KeyMods::CONTROL) => Some(DeleteTillEnd),
+    (Char('a'), KeyMods::CONTROL) | (Home, KeyMods::NONE) => Some(GoToStart),
+    (Char('e'), KeyMods::CONTROL) | (End, KeyMods::NONE) => Some(GoToEnd),
+    (Char(c), KeyMods::NONE) | (Char(c), KeyMods::SHIFT) => Some(InsertChar(c)),
+    (_, _) => None,
   }
 }

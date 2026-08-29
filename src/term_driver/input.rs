@@ -16,6 +16,8 @@ pub struct EventDecoder {
   scanner: Scanner,
   /// Text being collected between bracketed paste markers.
   paste: Option<String>,
+  /// The previous pasted byte was CR, so a following LF is the same newline.
+  paste_cr: bool,
   #[cfg(windows)]
   pub windows_mouse_buttons: u32,
 }
@@ -25,6 +27,7 @@ impl EventDecoder {
     Self {
       scanner: Scanner::new(ScanMode::Input),
       paste: None,
+      paste_cr: false,
       #[cfg(windows)]
       windows_mouse_buttons: 0,
     }
@@ -36,23 +39,36 @@ impl EventDecoder {
     self.scanner = scanner;
   }
 
-  /// Resolves a trailing lone ESC into an Esc key press. Call when a read
-  /// returns and no more input is immediately available.
+  /// Resolves a trailing lone ESC into an Esc key press. Call when no more
+  /// input has arrived shortly after a read.
   pub fn flush<F: FnMut(E)>(&mut self, mut f: F) {
     let mut scanner = std::mem::take(&mut self.scanner);
     scanner.flush(|seq| self.decode(seq, &mut f));
     self.scanner = scanner;
   }
 
+  pub fn esc_pending(&self) -> bool {
+    self.scanner.esc_pending()
+  }
+
   fn decode<F: FnMut(E)>(&mut self, seq: Seq, f: &mut F) {
     if let Some(text) = &mut self.paste {
+      let after_cr = std::mem::replace(&mut self.paste_cr, false);
       match seq {
         Seq::Text(run) => {
           if text.len() < MAX_PASTE_BYTES {
             text.push_str(run);
           }
         }
-        Seq::Ctl(b'\r') | Seq::Ctl(b'\n') => text.push('\n'),
+        Seq::Ctl(b'\r') => {
+          text.push('\n');
+          self.paste_cr = true;
+        }
+        Seq::Ctl(b'\n') => {
+          if !after_cr {
+            text.push('\n');
+          }
+        }
         Seq::Ctl(b'\t') => text.push('\t'),
         Seq::Csi(p)
           if p.prefix == 0 && p.final_ == b'~' && p.get(0, 0) == 201 =>
@@ -418,9 +434,8 @@ mod tests {
     // Lone ESC resolves on flush.
     assert_eq!(keys_of(&[b"\x1b"]), vec![key("<Esc>")]);
     assert_eq!(keys_of(&[b"\x1b\x1b"]), vec![key("<Esc>")]);
-    // ESC split before a chord char still decodes as Alt: the flush only
-    // happens after each read chunk in the driver, and here the chunks
-    // arrive in one read each.
+    // ESC split before a chord char still decodes as Alt: the driver only
+    // flushes when nothing follows the ESC for a while.
     assert_eq!(keys_of(&[b"\x1bq"]), vec![key("<M-q>")]);
   }
 
@@ -473,6 +488,12 @@ mod tests {
         E::Paste("paste".to_string()),
         E::Key(key("<b>")),
       ]
+    );
+    // CRLF is one newline, also when split across reads; a lone LF or CR
+    // is one too.
+    assert_eq!(
+      decode(&[b"\x1b[200~a\r\nb\r", b"\nc\n\rd\x1b[201~"]),
+      vec![E::Paste("a\nb\nc\n\nd".to_string())]
     );
   }
 

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::console::action::{Action, CopyMove as ActionCopyMove, ScrollUnit};
-use crate::console::server_message::ClientId;
+use crate::console::client::ClientId;
 use crate::kernel::task::TaskId;
 use crate::term::key::{Key, key_spec};
 

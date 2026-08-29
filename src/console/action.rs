@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::console::server_message::ClientId;
+use crate::console::client::ClientId;
 use crate::kernel::task::TaskId;
 use crate::term::key::{Key, key_spec};
 
@@ -83,6 +83,17 @@ pub enum Action {
 }
 
 impl Action {
+  /// The serde tag, e.g. `start-task`.
+  pub fn name(&self) -> String {
+    match serde_json::to_value(self) {
+      Ok(serde_json::Value::Object(map)) => match map.get("c") {
+        Some(serde_json::Value::String(name)) => name.clone(),
+        _ => String::new(),
+      },
+      _ => String::new(),
+    }
+  }
+
   pub fn desc(&self) -> String {
     match self {
       Action::Batch { cmds: _ } => "Send multiple events".to_string(),

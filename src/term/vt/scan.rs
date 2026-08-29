@@ -112,6 +112,11 @@ impl Scanner {
     }
   }
 
+  /// True while a lone ESC is waiting to see whether more bytes follow.
+  pub fn esc_pending(&self) -> bool {
+    self.state == State::Esc
+  }
+
   pub fn feed<F: for<'a> FnMut(Seq<'a>)>(&mut self, input: &[u8], mut f: F) {
     let mut i = 0;
     while i < input.len() {

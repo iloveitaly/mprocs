@@ -1,6 +1,5 @@
-use crate::console::server_message::ClientId;
 use crate::console::{
-  keymap::KeymapGroup, task::view::TaskView, widgets::list::ListState,
+  keymap::KeymapGroup, task_view::TaskView, widgets::list::ListState,
 };
 use crate::kernel::task::TaskId;
 
@@ -27,16 +26,21 @@ impl Scope {
       Scope::TermZoom => true,
     }
   }
+
+  pub fn is_term(&self) -> bool {
+    match self {
+      Scope::Tasks => false,
+      Scope::Term => true,
+      Scope::TermZoom => true,
+    }
+  }
 }
 
 pub struct State {
-  pub current_client_id: Option<ClientId>,
-
   pub scope: Scope,
   pub tasks: Vec<TaskView>,
   pub tasks_list: ListState,
   pub hide_keymap_window: bool,
-
   pub quitting: bool,
 }
 
@@ -45,36 +49,25 @@ impl State {
     self.tasks_list.selected()
   }
 
-  pub fn get_current_task(&self) -> Option<&TaskView> {
+  pub fn select(&mut self, index: usize) {
+    self.tasks_list.select(index, self.tasks.len());
+  }
+
+  pub fn current_task(&self) -> Option<&TaskView> {
     self.tasks.get(self.tasks_list.selected())
   }
 
-  pub fn select_task(&mut self, index: usize) {
-    self.tasks_list.select(index);
-    if let Some(task_handle) = self.tasks.get_mut(index) {
-      task_handle.focus();
-    }
+  pub fn task_mut(&mut self, id: TaskId) -> Option<&mut TaskView> {
+    self.tasks.iter_mut().find(|t| t.id == id)
   }
 
-  pub fn get_task_mut(&mut self, id: TaskId) -> Option<&mut TaskView> {
-    self.tasks.iter_mut().find(|p| p.id() == id)
-  }
-
-  pub fn get_keymap_group(&self) -> KeymapGroup {
+  pub fn keymap_group(&self) -> KeymapGroup {
     match self.scope {
       Scope::Tasks => KeymapGroup::Tasks,
-      Scope::Term | Scope::TermZoom => match self.get_current_task() {
-        Some(task) if task.copy_active() => KeymapGroup::Copy,
+      Scope::Term | Scope::TermZoom => match self.current_task() {
+        Some(task) if task.present.is_some() => KeymapGroup::Copy,
         _ => KeymapGroup::Term,
       },
     }
-  }
-
-  pub fn all_tasks_down(&self) -> bool {
-    self.tasks.iter().all(|p| !p.is_up())
-  }
-
-  pub fn toggle_keymap_window(&mut self) {
-    self.hide_keymap_window = !self.hide_keymap_window;
   }
 }

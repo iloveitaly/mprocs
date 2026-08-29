@@ -86,6 +86,26 @@ impl Namespace {
       .map_or_else(Vec::new, |ns| ns.paths.iter())
   }
 
+  /// Tasks a subscription at `key` with `mode` would match.
+  pub fn in_scope(
+    &self,
+    key: &TaskKey,
+    mode: SubMode,
+  ) -> Vec<(TaskPath, TaskId)> {
+    let Some(space) = self.spaces.get(&key.space) else {
+      return Vec::new();
+    };
+    let mut result = Vec::new();
+    if let Some(id) = space.paths.resolve(&key.path) {
+      result.push((key.path.clone(), id));
+    }
+    match mode {
+      SubMode::Exact => (),
+      SubMode::Subtree => result.extend(space.paths.descendants(&key.path)),
+    }
+    result
+  }
+
   // ---- Pub/sub ----
 
   pub fn subscribe(
@@ -115,6 +135,18 @@ impl Namespace {
     for space in self.spaces.values_mut() {
       space.subs.remove_subscriber(subscriber);
     }
+  }
+
+  pub fn is_subscribed(
+    &self,
+    subscriber: TaskId,
+    space: &TaskSpaceId,
+    path: &TaskPath,
+  ) -> bool {
+    self
+      .spaces
+      .get(space)
+      .is_some_and(|ns| ns.subs.is_subscribed(subscriber, path))
   }
 
   pub fn collect(&self, key: &TaskKey, out: &mut HashSet<TaskId>) {

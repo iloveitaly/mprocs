@@ -5,9 +5,9 @@ use indexmap::IndexMap;
 
 use crate::cfg::{CfgCx, CfgNode, CfgObj};
 use crate::config::task_log::TaskLogConfig;
-use crate::console::task::StopSignal;
 use crate::parse_shell::split_argv;
 use crate::process::process_spec::ProcessSpec;
+use crate::task::process_task::StopSignal;
 
 const DEFAULT_SCROLLBACK_LEN: usize = 1000;
 const DEFAULT_MOUSE_SCROLL_SPEED: usize = 5;

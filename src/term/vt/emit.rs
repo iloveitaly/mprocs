@@ -58,6 +58,13 @@ pub fn kitty_push(out: &mut Vec<u8>, flags: u8) {
   out.push(b'u');
 }
 
+/// Reply to a kitty keyboard flags query.
+pub fn kitty_flags_reply(out: &mut Vec<u8>, flags: u8) {
+  out.extend_from_slice(b"\x1b[?");
+  num(out, flags as i64);
+  out.push(b'u');
+}
+
 /// xterm modifyOtherKeys level (0 disables).
 pub fn modify_other_keys(out: &mut Vec<u8>, level: u8) {
   out.extend_from_slice(b"\x1b[>4;");
@@ -329,15 +336,30 @@ pub fn key(out: &mut Vec<u8>, key: &Key, modes: KeyEncodeModes) {
   };
 
   match code {
+    // Kitty "disambiguate escape codes": Esc and every ctrl/alt chord are
+    // CSI u so the peer never has to guess at a bare ESC or ESC-prefix.
+    Esc if modes.enable_csi_u_key_encoding => {
+      csi_u_key(out, '\x1b', mods, true);
+    }
     Char(c)
-      if is_ambiguous_ascii_ctrl(c)
-        && mods.contains(KeyMods::CONTROL)
+      if mods.intersects(KeyMods::CONTROL | KeyMods::ALT)
         && modes.enable_csi_u_key_encoding =>
     {
-      csi_u_key(out, c, mods, modes.enable_csi_u_key_encoding);
+      csi_u_key(out, c, mods, true);
+    }
+    Enter | Backspace | Tab
+      if mods.contains(KeyMods::ALT) && modes.enable_csi_u_key_encoding =>
+    {
+      let c = match code {
+        Enter => '\r',
+        Backspace => '\x7f',
+        Tab => '\t',
+        _ => unreachable!(),
+      };
+      csi_u_key(out, c, mods, true);
     }
     Char(c) if c.is_ascii_uppercase() && mods.contains(KeyMods::CONTROL) => {
-      csi_u_key(out, c, mods, modes.enable_csi_u_key_encoding);
+      csi_u_key(out, c, mods, false);
     }
 
     Char(c)
@@ -483,7 +505,9 @@ fn csi_u_key(out: &mut Vec<u8>, c: char, mods: KeyMods, csi_u: bool) {
     } else {
       c
     };
-    if mods.contains(KeyMods::ALT) {
+    // Non-ascii glyphs (macOS Option keys) are sent alone; see the ALT
+    // arm in `key` for why.
+    if mods.contains(KeyMods::ALT) && c.is_ascii() {
       out.push(0x1b);
     }
     push_char(out, c);
@@ -651,6 +675,38 @@ mod tests {
     out.clear();
     modify_other_keys(&mut out, 2);
     assert_eq!(out, b"\x1b[>4;2m");
+  }
+
+  #[test]
+  fn key_kitty_disambiguate() {
+    fn enc(spec: &str, csi_u: bool) -> Vec<u8> {
+      let mut out = Vec::new();
+      let modes = KeyEncodeModes {
+        enable_csi_u_key_encoding: csi_u,
+        ..KeyEncodeModes::default()
+      };
+      key(&mut out, &Key::parse(spec).unwrap(), modes);
+      out
+    }
+    // Legacy encoding when the program did not ask for the flag.
+    assert_eq!(enc("<Esc>", false), b"\x1b");
+    assert_eq!(enc("<C-c>", false), b"\x03");
+    assert_eq!(enc("<M-j>", false), b"\x1bj");
+    assert_eq!(enc("<C-Enter>", false), b"\r");
+    // With the flag, anything a peer could mistake for an ESC prefix is
+    // CSI u; plain text and unmodified special keys stay legacy.
+    assert_eq!(enc("<Esc>", true), b"\x1b[27;1u");
+    assert_eq!(enc("<M-Esc>", true), b"\x1b[27;3u");
+    assert_eq!(enc("<C-c>", true), b"\x1b[99;5u");
+    assert_eq!(enc("<M-j>", true), b"\x1b[106;3u");
+    assert_eq!(enc("<C-M-a>", true), b"\x1b[97;7u");
+    assert_eq!(enc("<C-Enter>", true), b"\x1b[13;5u");
+    assert_eq!(enc("<M-Enter>", true), b"\x1b[13;3u");
+    assert_eq!(enc("<M-BS>", true), b"\x1b[127;3u");
+    assert_eq!(enc("<M-Tab>", true), b"\x1b[9;3u");
+    assert_eq!(enc("<a>", true), b"a");
+    assert_eq!(enc("<Enter>", true), b"\r");
+    assert_eq!(enc("<Up>", true), b"\x1b[A");
   }
 
   #[test]

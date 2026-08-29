@@ -14,6 +14,11 @@ const MODE_HIDE_CURSOR: u8 = 0b0000_0100;
 const MODE_ALTERNATE_SCREEN: u8 = 0b0000_1000;
 const MODE_BRACKETED_PASTE: u8 = 0b0001_0000;
 
+/// Kitty keyboard protocol flags implemented by the input encoder.
+///
+/// TODO: We currently support only "disambiguate escape codes".
+pub const KITTY_KEYBOARD_SUPPORTED_FLAGS: u8 = 0b0000_0001;
+
 #[derive(Clone, Debug)]
 pub enum CharSet {
   Ascii,
@@ -97,6 +102,11 @@ pub struct Screen {
   /// If true, writing a character inserts a new cell
   insert: bool,
 
+  /// Kitty keyboard protocol flag stacks, one per screen; the top entry is
+  /// the active flags.
+  kitty_flags: Vec<u8>,
+  alt_kitty_flags: Vec<u8>,
+
   title: String,
 }
 
@@ -132,6 +142,9 @@ impl Screen {
       shift_out: false,
 
       insert: false,
+
+      kitty_flags: Vec::new(),
+      alt_kitty_flags: Vec::new(),
 
       title: String::new(),
     }
@@ -224,6 +237,13 @@ impl Screen {
     self.mode(MODE_APPLICATION_CURSOR)
   }
 
+  /// Active kitty keyboard protocol flags (0 = legacy encoding).
+  #[must_use]
+  pub fn kitty_flags(&self) -> u8 {
+    self.kitty_flags.last().copied().unwrap_or(0)
+      & KITTY_KEYBOARD_SUPPORTED_FLAGS
+  }
+
   /// Returns whether the terminal should be in hide cursor mode.
   #[must_use]
   pub fn hide_cursor(&self) -> bool {
@@ -264,11 +284,17 @@ impl Screen {
 
   fn enter_alternate_grid(&mut self) {
     self.grid_mut().set_scrollback(0);
-    self.set_mode(MODE_ALTERNATE_SCREEN);
+    if !self.mode(MODE_ALTERNATE_SCREEN) {
+      self.set_mode(MODE_ALTERNATE_SCREEN);
+      std::mem::swap(&mut self.kitty_flags, &mut self.alt_kitty_flags);
+    }
   }
 
   fn exit_alternate_grid(&mut self) {
-    self.clear_mode(MODE_ALTERNATE_SCREEN);
+    if self.mode(MODE_ALTERNATE_SCREEN) {
+      self.clear_mode(MODE_ALTERNATE_SCREEN);
+      std::mem::swap(&mut self.kitty_flags, &mut self.alt_kitty_flags);
+    }
   }
 
   fn save_cursor(&mut self) {
@@ -622,6 +648,7 @@ pub enum Reply {
     row: u16,
     col: u16,
   },
+  KittyFlags(u8),
 }
 
 impl Screen {
@@ -835,6 +862,37 @@ impl Screen {
       // DA1 - Primary Device Attributes
       // https://terminalguide.namepad.de/seq/csi_sc/
       (0, 0, b'c') => events.push(VtEvent::Reply(Reply::PrimaryDeviceAttrs)),
+      // Kitty keyboard protocol
+      // https://sw.kovidgoyal.net/kitty/keyboard-protocol/
+      (b'?', 0, b'u') => {
+        events.push(VtEvent::Reply(Reply::KittyFlags(self.kitty_flags())))
+      }
+      (b'>', 0, b'u') => {
+        if self.kitty_flags.len() >= 16 {
+          self.kitty_flags.remove(0);
+        }
+        self
+          .kitty_flags
+          .push((p.get(0, 0) & KITTY_KEYBOARD_SUPPORTED_FLAGS as u32) as u8);
+      }
+      (b'<', 0, b'u') => {
+        let n = p.get(0, 1).max(1) as usize;
+        let len = self.kitty_flags.len().saturating_sub(n);
+        self.kitty_flags.truncate(len);
+      }
+      (b'=', 0, b'u') => {
+        let flags =
+          (p.get(0, 0) & KITTY_KEYBOARD_SUPPORTED_FLAGS as u32) as u8;
+        if self.kitty_flags.is_empty() {
+          self.kitty_flags.push(0);
+        }
+        let top = self.kitty_flags.last_mut().expect("just pushed");
+        match p.get(1, 1) {
+          2 => *top |= flags,
+          3 => *top &= !flags,
+          _ => *top = flags,
+        }
+      }
       // VPA - Vertical Position Absolute
       // https://terminalguide.namepad.de/seq/csi_sd/
       (0, 0, b'd') => self.grid_mut().row_set(p.get16(0, 1).max(1) - 1),
@@ -1146,14 +1204,23 @@ fn csi_todo(p: &Params) {
 /// colon forms. Returns the color and the index after the consumed params.
 fn sgr_color(p: &Params, i: usize) -> (Color, usize) {
   match p.get(i + 1, 2) {
-    2 => (
-      Color::Rgb(
-        p.get(i + 2, 0).min(255) as u8,
-        p.get(i + 3, 0).min(255) as u8,
-        p.get(i + 4, 0).min(255) as u8,
-      ),
-      i + 5,
-    ),
+    2 => {
+      // The ITU colon form may carry an empty color space id before the
+      // components: `38:2::r:g:b`.
+      let i = if p.is_sub(i + 2) && p.get_opt(i + 2).is_none() {
+        i + 1
+      } else {
+        i
+      };
+      (
+        Color::Rgb(
+          p.get(i + 2, 0).min(255) as u8,
+          p.get(i + 3, 0).min(255) as u8,
+          p.get(i + 4, 0).min(255) as u8,
+        ),
+        i + 5,
+      )
+    }
     5 => (Color::Idx(p.get(i + 2, 0).min(255) as u8), i + 3),
     _ => (Color::Default, i + 2),
   }
@@ -1266,7 +1333,7 @@ mod tests {
     let mut s = screen(20, 2);
     feed(
       &mut s,
-      b"\x1b[1;31mR\x1b[0m\x1b[38;5;100mI\x1b[38;2;1;2;3mT\x1b[38:5:200mC",
+      b"\x1b[1;31mR\x1b[0m\x1b[38;5;100mI\x1b[38;2;1;2;3mT\x1b[38:5:200mC\x1b[38:2::4:5:6;1mX",
     );
     let cell = s.cell(0, 0).unwrap();
     assert!(cell.attrs().bold());
@@ -1274,6 +1341,9 @@ mod tests {
     assert_eq!(s.cell(0, 1).unwrap().attrs().fgcolor, Color::Idx(100));
     assert_eq!(s.cell(0, 2).unwrap().attrs().fgcolor, Color::Rgb(1, 2, 3));
     assert_eq!(s.cell(0, 3).unwrap().attrs().fgcolor, Color::Idx(200));
+    let cell = s.cell(0, 4).unwrap();
+    assert_eq!(cell.attrs().fgcolor, Color::Rgb(4, 5, 6));
+    assert!(cell.attrs().bold(), "params after the colour still apply");
   }
 
   #[test]
@@ -1328,6 +1398,56 @@ mod tests {
     assert!(!s.application_cursor());
     feed(&mut s, b"\x1b[?25l");
     assert!(s.hide_cursor());
+  }
+
+  #[test]
+  fn kitty_keyboard_flags() {
+    let mut s = screen(10, 4);
+    assert_eq!(s.kitty_flags(), 0);
+    assert_eq!(
+      feed(&mut s, b"\x1b[?u"),
+      vec![VtEvent::Reply(Reply::KittyFlags(0))]
+    );
+
+    // Unsupported flags are neither activated nor advertised.
+    feed(&mut s, b"\x1b[>2u");
+    assert_eq!(s.kitty_flags(), 0);
+    assert_eq!(
+      feed(&mut s, b"\x1b[?u"),
+      vec![VtEvent::Reply(Reply::KittyFlags(0))]
+    );
+    feed(&mut s, b"\x1b[<u");
+
+    feed(&mut s, b"\x1b[>1u");
+    assert_eq!(s.kitty_flags(), 1);
+    feed(&mut s, b"\x1b[>15u");
+    assert_eq!(s.kitty_flags(), 1);
+    assert_eq!(
+      feed(&mut s, b"\x1b[?u"),
+      vec![VtEvent::Reply(Reply::KittyFlags(1))]
+    );
+    feed(&mut s, b"\x1b[=4;3u");
+    assert_eq!(s.kitty_flags(), 1);
+    feed(&mut s, b"\x1b[=4;2u");
+    assert_eq!(s.kitty_flags(), 1);
+    feed(&mut s, b"\x1b[=2u");
+    assert_eq!(s.kitty_flags(), 0);
+    assert_eq!(
+      feed(&mut s, b"\x1b[?u"),
+      vec![VtEvent::Reply(Reply::KittyFlags(0))]
+    );
+
+    // The alternate screen has its own stack.
+    feed(&mut s, b"\x1b[?1049h");
+    assert_eq!(s.kitty_flags(), 0);
+    feed(&mut s, b"\x1b[>1u");
+    feed(&mut s, b"\x1b[?1049l");
+    assert_eq!(s.kitty_flags(), 0);
+
+    feed(&mut s, b"\x1b[<u");
+    assert_eq!(s.kitty_flags(), 1);
+    feed(&mut s, b"\x1b[<5u");
+    assert_eq!(s.kitty_flags(), 0);
     // Combined modes in one sequence.
     feed(&mut s, b"\x1b[?1000;1006h");
     assert_eq!(s.mouse_protocol_mode(), MouseProtocolMode::PressRelease);

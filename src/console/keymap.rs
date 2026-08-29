@@ -3,13 +3,17 @@ use std::collections::HashMap;
 use crate::console::action::Action;
 use crate::term::key::Key;
 
+#[derive(Default)]
+pub struct Bindings {
+  pub by_key: HashMap<Key, Action>,
+  pub by_action: HashMap<Action, Key>,
+}
+
+#[derive(Default)]
 pub struct Keymap {
-  pub tasks: HashMap<Key, Action>,
-  pub rev_tasks: HashMap<Action, Key>,
-  pub term: HashMap<Key, Action>,
-  pub rev_term: HashMap<Action, Key>,
-  pub copy: HashMap<Key, Action>,
-  pub rev_copy: HashMap<Action, Key>,
+  tasks: Bindings,
+  term: Bindings,
+  copy: Bindings,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -21,57 +25,32 @@ pub enum KeymapGroup {
 
 impl Keymap {
   pub fn new() -> Self {
-    Keymap {
-      tasks: HashMap::new(),
-      rev_tasks: HashMap::new(),
-      term: HashMap::new(),
-      rev_term: HashMap::new(),
-      copy: HashMap::new(),
-      rev_copy: HashMap::new(),
-    }
+    Self::default()
   }
 
-  pub fn bind(&mut self, group: KeymapGroup, key: Key, event: Action) {
-    let (map, rev_map) = match group {
-      KeymapGroup::Tasks => (&mut self.tasks, &mut self.rev_tasks),
-      KeymapGroup::Term => (&mut self.term, &mut self.rev_term),
-      KeymapGroup::Copy => (&mut self.copy, &mut self.rev_copy),
-    };
-    map.insert(key, event.clone());
-    rev_map.insert(event, key);
-  }
-
-  pub fn bind_p(&mut self, key: Key, event: Action) {
-    self.bind(KeymapGroup::Tasks, key, event);
-  }
-
-  pub fn bind_t(&mut self, key: Key, event: Action) {
-    self.bind(KeymapGroup::Term, key, event);
-  }
-
-  pub fn bind_c(&mut self, key: Key, event: Action) {
-    self.bind(KeymapGroup::Copy, key, event);
-  }
-
-  pub fn resolve(&self, group: KeymapGroup, key: &Key) -> Option<&Action> {
-    let map = match group {
+  pub fn group(&self, group: KeymapGroup) -> &Bindings {
+    match group {
       KeymapGroup::Tasks => &self.tasks,
       KeymapGroup::Term => &self.term,
       KeymapGroup::Copy => &self.copy,
-    };
-    map.get(key)
+    }
   }
 
-  pub fn resolve_key(
-    &self,
-    group: KeymapGroup,
-    event: &Action,
-  ) -> Option<&Key> {
-    let rev_map = match group {
-      KeymapGroup::Tasks => &self.rev_tasks,
-      KeymapGroup::Term => &self.rev_term,
-      KeymapGroup::Copy => &self.rev_copy,
+  pub fn bind(&mut self, group: KeymapGroup, key: Key, action: Action) {
+    let bindings = match group {
+      KeymapGroup::Tasks => &mut self.tasks,
+      KeymapGroup::Term => &mut self.term,
+      KeymapGroup::Copy => &mut self.copy,
     };
-    rev_map.get(event)
+    bindings.by_key.insert(key, action.clone());
+    bindings.by_action.insert(action, key);
+  }
+
+  pub fn action(&self, group: KeymapGroup, key: &Key) -> Option<&Action> {
+    self.group(group).by_key.get(key)
+  }
+
+  pub fn key(&self, group: KeymapGroup, action: &Action) -> Option<&Key> {
+    self.group(group).by_action.get(action)
   }
 }

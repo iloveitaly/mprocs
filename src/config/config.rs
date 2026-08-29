@@ -16,7 +16,7 @@ const ROOT_KEYS_GLOBAL: &[&str] = &[
   "tui",
   "keymap",
   "on_init",
-  "on_all_finished",
+  "on_idle",
 ];
 
 /// Top-level keys allowed in a project `dekit.yaml`.
@@ -26,7 +26,7 @@ const ROOT_KEYS_LOCAL: &[&str] = &[
   "tui",
   "keymap",
   "on_init",
-  "on_all_finished",
+  "on_idle",
   "tasks",
 ];
 
@@ -38,7 +38,7 @@ pub struct Config {
   pub tui: TuiConfig,
   pub keymap: KeymapConfig,
   pub on_init: Option<Hook>,
-  pub on_all_finished: Option<Hook>,
+  pub on_idle: Option<Hook>,
 }
 
 impl Config {
@@ -50,7 +50,7 @@ impl Config {
       tui: TuiConfig::builtin(),
       keymap: KeymapConfig::default(),
       on_init: None,
-      on_all_finished: None,
+      on_idle: None,
     }
   }
 
@@ -107,8 +107,8 @@ impl Config {
     if let Some(hook) = hook_from_cfg(obj, "on_init")? {
       self.on_init = Some(hook);
     }
-    if let Some(hook) = hook_from_cfg(obj, "on_all_finished")? {
-      self.on_all_finished = Some(hook);
+    if let Some(hook) = hook_from_cfg(obj, "on_idle")? {
+      self.on_idle = Some(hook);
     }
     Ok(())
   }

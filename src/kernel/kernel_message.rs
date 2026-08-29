@@ -85,6 +85,9 @@ pub enum KernelCommand {
 
   SubscribePath(TaskKey, SubMode),
   UnsubscribePath(TaskKey, SubMode),
+  /// Sends `true`/`false` whenever the selected set gains its first active
+  /// task or loses its last one.
+  WatchActive(TaskSelector, UnboundedSender<bool>),
 
   // Task reporting
   TaskStarted,
@@ -303,6 +306,15 @@ impl TaskContext {
 
   pub fn subscribe_path(&self, key: TaskKey, mode: SubMode) {
     self.send(KernelCommand::SubscribePath(key, mode));
+  }
+
+  pub fn watch_active(
+    &self,
+    selector: TaskSelector,
+  ) -> tokio::sync::mpsc::UnboundedReceiver<bool> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    self.send(KernelCommand::WatchActive(selector, tx));
+    rx
   }
 
   pub fn unsubscribe_path(&self, key: TaskKey, mode: SubMode) {

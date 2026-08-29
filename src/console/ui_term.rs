@@ -1,26 +1,27 @@
-use crate::console::state::{Scope, State};
-use crate::term::{Color, Grid, Screen, attrs::Attrs, grid::Rect};
+use crate::console::state::State;
+use crate::term::{
+  Color, Grid, Screen,
+  attrs::Attrs,
+  grid::{BorderType, Pos, Rect},
+};
 
-pub fn render_term(area: Rect, grid: &mut Grid, state: &mut State) {
+pub fn render_term(area: Rect, grid: &mut Grid, state: &State) {
   if area.width < 3 || area.height < 3 {
     return;
   }
 
-  let active = match state.scope {
-    Scope::Tasks => false,
-    Scope::Term | Scope::TermZoom => true,
-  };
+  let active = state.scope.is_term();
 
-  let Some(task) = state.get_current_task() else {
+  let Some(task) = state.current_task() else {
     return;
   };
 
-  let chars = match active {
-    true => crate::term::grid::BorderType::Thick,
-    false => crate::term::grid::BorderType::Plain,
-  }
-  .chars();
-  grid.draw_block(area, &chars, Attrs::default());
+  let border = if active {
+    BorderType::Thick
+  } else {
+    BorderType::Plain
+  };
+  grid.draw_block(area, &border.chars(), Attrs::default());
 
   let handle = task.present.as_ref().unwrap_or(&task.vt);
   let Ok(screen) = handle.read() else {
@@ -50,7 +51,7 @@ pub fn render_term(area: Rect, grid: &mut Grid, state: &mut State) {
 
   if active && !screen.hide_cursor() {
     let (row, col) = screen.cursor_position();
-    grid.cursor_pos = Some(crate::term::grid::Pos {
+    grid.cursor_pos = Some(Pos {
       col: inner.x + col,
       row: inner.y + row,
     });
@@ -61,13 +62,10 @@ pub fn render_term(area: Rect, grid: &mut Grid, state: &mut State) {
 fn render_screen(screen: &Screen, area: Rect, grid: &mut Grid) {
   for row in 0..area.height {
     for col in 0..area.width {
-      let to_cell = if let Some(cell) =
-        grid.drawing_cell_mut(crate::term::grid::Pos {
-          col: area.x + col,
-          row: area.y + row,
-        }) {
-        cell
-      } else {
+      let Some(to_cell) = grid.drawing_cell_mut(Pos {
+        col: area.x + col,
+        row: area.y + row,
+      }) else {
         continue;
       };
       if let Some(cell) = screen.cell(row, col) {
@@ -78,11 +76,4 @@ fn render_screen(screen: &Screen, area: Rect, grid: &mut Grid) {
       }
     }
   }
-}
-
-pub fn term_check_hit(area: Rect, x: u16, y: u16) -> bool {
-  area.x <= x
-    && area.x + area.width >= x + 1
-    && area.y <= y
-    && area.y + area.height >= y + 1
 }

@@ -1,55 +1,30 @@
 use std::fmt::Debug;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
-  console::server_message::{ClientId, ServerMessage},
   kernel::kernel_message::TaskSender,
   protocol::{
-    ConnReceiver, ConnSender, CtlMsg, Msg, RpcError, RpcRequest, codes,
-    ctl::EVENT_INPUT, ok_result, server_handshake,
+    ConnReceiver, ConnSender, CtlMsg, Msg, ctl::EVENT_INPUT, ok_result,
   },
   term::{ScreenDiffer, Size, TermEvent},
 };
 
-pub async fn client_loop(
-  id: ClientId,
-  app_sender: TaskSender,
-  (mut sender, mut receiver): (ConnSender, ConnReceiver),
-) {
-  if let Err(err) = server_handshake(&mut sender, &mut receiver).await {
-    log::warn!("client_loop: handshake failed: {err}");
-    return;
-  }
-  let request = match receiver.recv_ctl().await {
-    Ok(CtlMsg::Request(request)) => request,
-    Ok(msg) => {
-      log::warn!("client_loop: expected tui_attach request, got {msg:?}");
-      return;
-    }
-    Err(err) => {
-      log::warn!("client_loop: {err}");
-      return;
-    }
-  };
-  match RpcRequest::from_wire(&request.method, request.params) {
-    Ok(RpcRequest::TuiAttach { width, height }) => {
-      client_session(
-        id,
-        app_sender,
-        Size { width, height },
-        request.id,
-        sender,
-        receiver,
-      )
-      .await;
-    }
-    Ok(_) | Err(_) => {
-      let error = RpcError::new(
-        codes::UNKNOWN_METHOD,
-        "only tui_attach is supported here",
-      );
-      let _ = sender.send_ctl(CtlMsg::err(request.id, error)).await;
-    }
-  }
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct ClientId(pub u32);
+
+#[derive(Debug)]
+pub enum ClientEvent {
+  Input {
+    client_id: ClientId,
+    event: TermEvent,
+  },
+  Connected {
+    handle: ClientHandle,
+  },
+  Disconnected {
+    client_id: ClientId,
+  },
 }
 
 pub async fn client_session(
@@ -65,11 +40,11 @@ pub async fn client_session(
     return;
   }
 
-  app_sender.send(ServerMessage::ClientConnected {
+  app_sender.send(ClientEvent::Connected {
     handle: ClientHandle {
       id,
       sender,
-      screen_size: size,
+      size,
       differ: ScreenDiffer::new(),
     },
   });
@@ -91,7 +66,7 @@ pub async fn client_session(
         }
         match serde_json::from_value::<TermEvent>(event.params) {
           Ok(event) => {
-            app_sender.send(ServerMessage::ClientInput {
+            app_sender.send(ClientEvent::Input {
               client_id: id,
               event,
             });
@@ -109,13 +84,13 @@ pub async fn client_session(
       }
     }
   }
-  app_sender.send(ServerMessage::ClientDisconnected { client_id: id });
+  app_sender.send(ClientEvent::Disconnected { client_id: id });
 }
 
 pub struct ClientHandle {
   pub id: ClientId,
   pub sender: ConnSender,
-  pub screen_size: Size,
+  pub size: Size,
   pub differ: ScreenDiffer,
 }
 
@@ -124,15 +99,5 @@ impl Debug for ClientHandle {
     f.debug_struct("ClientHandle")
       .field("id", &self.id)
       .finish()
-  }
-}
-
-impl ClientHandle {
-  pub fn size(&self) -> Size {
-    self.screen_size
-  }
-
-  pub fn resize(&mut self, size: Size) {
-    self.screen_size = size;
   }
 }

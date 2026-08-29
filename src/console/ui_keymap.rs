@@ -3,31 +3,31 @@ use crate::console::{
   keymap::{Keymap, KeymapGroup},
   state::State,
 };
-use crate::term::{Color, Grid, attrs::Attrs, grid::Rect};
+use crate::term::{
+  Color, Grid,
+  attrs::Attrs,
+  grid::{BorderType, Rect},
+};
 
 pub fn render_keymap(
   area: Rect,
   grid: &mut Grid,
-  state: &mut State,
+  state: &State,
   keymap: &Keymap,
 ) {
   if area.width <= 3 || area.height < 3 {
     return;
   }
 
-  grid.draw_block(
-    area.into(),
-    &crate::term::grid::BorderType::Plain.chars(),
-    Attrs::default(),
-  );
+  grid.draw_block(area, &BorderType::Plain.chars(), Attrs::default());
   grid.draw_text(
     Rect::new(area.x + 1, area.y, area.width - 2, 1),
     "Help",
     Attrs::default(),
   );
 
-  let group = state.get_keymap_group();
-  let items = match group {
+  let group = state.keymap_group();
+  let items: &[Action] = match group {
     KeymapGroup::Tasks => &[
       Action::ToggleFocus,
       Action::Quit,
@@ -39,32 +39,28 @@ pub fn render_keymap(
       Action::Zoom,
       Action::ShowCommandsMenu,
       Action::ToggleKeymapWindow,
-    ][..],
-    KeymapGroup::Term => &[Action::ToggleFocus][..],
+    ],
+    KeymapGroup::Term => &[Action::ToggleFocus],
     KeymapGroup::Copy => &[
       Action::CopyModeEnd,
       Action::CopyModeCopy,
       Action::CopyModeLeave,
-    ][..],
+    ],
   };
 
-  let area: crate::term::grid::Rect = area.into();
-  let mut line = Rect {
-    x: area.x + 1,
-    y: area.y + 1,
-    width: area.width.saturating_sub(2),
-    height: area.height,
-  };
-  for event in items {
-    if let Some(key) = keymap.resolve_key(group, &event) {
-      let a = Attrs::default();
-      line.x = grid.draw_text(line, " <", a).right();
-      line.x = grid
-        .draw_text(line, &key.to_string(), Attrs::default().fg(Color::YELLOW))
-        .right();
-      line.x = grid.draw_text(line, ": ", a).right();
-      line.x = grid.draw_text(line, &event.desc(), a).right();
-      line.x = grid.draw_text(line, "> ", a).right();
+  let mut line = area.inner(1);
+  let plain = Attrs::default();
+  let yellow = Attrs::default().fg(Color::YELLOW);
+  for action in items {
+    let Some(key) = keymap.key(group, action) else {
+      continue;
+    };
+    for (text, attrs) in [
+      (" <".to_string(), plain),
+      (key.to_string(), yellow),
+      (format!(": {}> ", action.desc()), plain),
+    ] {
+      line = line.move_left(grid.draw_text(line, &text, attrs).width as i32);
     }
   }
 }

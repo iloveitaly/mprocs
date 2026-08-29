@@ -4,18 +4,19 @@ use serde_json::Value;
 
 use crate::{
   command::{Command, CommandError, CommandResult, Target, execute},
-  config::hook::Hook,
+  config::hook::{Hook, watch_idle},
   console::{
-    app::console_task_registration, app_client::client_session,
-    server_message::ClientId,
+    app::console_task_registration,
+    client::{ClientId, client_session},
   },
   daemon::{lockfile, socket::bind_server_socket},
   kernel::{
     kernel::Kernel,
     kernel_message::{
       KernelCommand, KernelQuery, KernelQueryResponse, TaskContext, TaskInfo,
+      TaskSelector,
     },
-    task::TaskState,
+    task::{TaskDef, TaskState},
     task_key::{TaskKey, TaskSpaceId},
     task_path::TaskPath,
   },
@@ -70,8 +71,16 @@ pub async fn run_server(
   let socket_path = lock_guard.socket_path().to_path_buf();
   let on_init = config.on_init.clone();
   let app_task_id = pc.alloc_id();
-  let app_registration =
-    console_task_registration(app_task_id, config.clone(), keymap);
+  let (app_registration, console_done) = console_task_registration(
+    app_task_id,
+    TaskDef {
+      space: TaskSpaceId::dekit(),
+      path: Some(TaskPath::new("console").expect("valid console path")),
+      ..TaskDef::default()
+    },
+    config.clone(),
+    keymap,
+  );
   if !kernel.register_task_registration(app_registration) {
     #[cfg(unix)]
     crate::process::unix_processes_waiter::UnixProcessesWaiter::uninit()?;
@@ -79,6 +88,16 @@ pub async fn run_server(
   }
   let app_sender = pc.get_task_sender(app_task_id);
   let kernel_handle = tokio::spawn(kernel.run());
+
+  // Watch before any task exists so the first start→exit fires the hook.
+  if let Some(hook) = config.on_idle.clone() {
+    watch_idle(
+      &pc,
+      TaskSelector::All(TaskSpaceId::default_space()),
+      hook,
+      app_sender.clone(),
+    );
+  }
 
   if let Err(err) = register_config_tasks(&config, &pc).await {
     pc.send(KernelCommand::Quit);
@@ -144,6 +163,13 @@ pub async fn run_server(
   });
 
   kernel_handle.await?;
+  // Let the console say goodbye to attached clients, but never let a
+  // stalled client keep the server (and the lock file) alive.
+  let _ = tokio::time::timeout(
+    std::time::Duration::from_secs(2),
+    console_done,
+  )
+  .await;
 
   // lock_guard is dropped here, removing lock + socket files.
   drop(lock_guard);
@@ -156,7 +182,7 @@ pub async fn run_server(
 
 /// Dispatch an accepted connection: handshake, then one RPC request or an
 /// attach session.
-async fn dispatch_connection(
+pub async fn dispatch_connection(
   client_id: ClientId,
   app_sender: crate::kernel::kernel_message::TaskSender,
   pc: TaskContext,

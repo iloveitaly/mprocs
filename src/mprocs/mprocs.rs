@@ -6,11 +6,15 @@ use std::{
   path::{Path, PathBuf},
 };
 
-use crate::console::app::create_app_task;
+use crate::config::hook::watch_idle;
+use crate::console::app::console_task_registration;
 use crate::console::keymap::Keymap;
 #[cfg(unix)]
 use crate::error::ResultLogger;
 use crate::kernel::kernel::Kernel;
+use crate::kernel::kernel_message::TaskSelector;
+use crate::kernel::task::TaskDef;
+use crate::kernel::task_key::TaskSpaceId;
 use crate::mprocs::config::{
   CmdConfig, Config, ConfigContext, ProcConfig, ServerConfig, default_stop,
 };
@@ -21,9 +25,11 @@ use crate::mprocs::package_json::load_npm_procs;
 use crate::mprocs::proc_log_config::{LogConfig, LogMode};
 use crate::mprocs::settings::Settings;
 use crate::mprocs::yaml_val::Val;
+use crate::task::config_tasks::register_config_tasks;
 use crate::{
   attach_client::client_main,
-  console::{app_client::client_loop, server_message::ClientId},
+  console::client::ClientId,
+  dekit::server::dispatch_connection,
   protocol::{ConnReceiver, ConnSender},
 };
 use anyhow::{Result, bail};
@@ -221,15 +227,19 @@ pub async fn run_app(args: Vec<String>) -> anyhow::Result<()> {
 
       #[cfg(unix)]
       crate::process::unix_processes_waiter::UnixProcessesWaiter::init()?;
-      let kernel = Kernel::new();
+      let mut kernel = Kernel::new();
       let pc = kernel.context();
       let server = config.server.take();
-      let (app_task_id, _app_ack) = create_app_task(
-        crate::config::config::Config::from(config),
+      let config = crate::config::config::Config::from(config);
+      let app_task_id = pc.alloc_id();
+      let (registration, _console_done) = console_task_registration(
+        app_task_id,
+        TaskDef::default(),
+        config.clone(),
         keymap,
-        &pc,
-        true,
       );
+      kernel.register_task_registration(registration);
+      let app_sender = pc.get_task_sender(app_task_id);
 
       if let Some(ServerConfig::Tcp(addr)) = server {
         let listener =
@@ -245,21 +255,36 @@ pub async fn run_app(args: Vec<String>) -> anyhow::Result<()> {
         ));
       }
 
-      let app_sender = pc.get_task_sender(app_task_id);
-      tokio::spawn(async move {
-        client_loop(
-          ClientId(1),
-          app_sender,
-          (srv_to_clt_sender, clt_to_srv_receiver),
-        )
-        .await
-      });
-
       tokio::spawn(async {
         kernel.run().await;
         #[cfg(unix)]
         crate::process::unix_processes_waiter::UnixProcessesWaiter::uninit()
           .log_ignore();
+      });
+
+      if let Some(hook) = config.on_idle.clone() {
+        watch_idle(
+          &pc,
+          TaskSelector::All(TaskSpaceId::default_space()),
+          hook,
+          app_sender.clone(),
+        );
+      }
+      register_config_tasks(&config, &pc).await?;
+      if let Some(hook) = &config.on_init {
+        hook.run(&pc, &app_sender);
+      }
+
+      let conn_pc = pc.clone();
+      tokio::spawn(async move {
+        dispatch_connection(
+          ClientId(1),
+          app_sender,
+          conn_pc,
+          srv_to_clt_sender,
+          clt_to_srv_receiver,
+        )
+        .await
       });
 
       let ret = client_main(clt_to_srv_sender, srv_to_clt_receiver).await;

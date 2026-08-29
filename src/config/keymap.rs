@@ -3,7 +3,7 @@ use indexmap::IndexMap;
 
 use crate::cfg::{CfgNode, CfgObj};
 use crate::console::action::{Action, CopyMove, ScrollUnit};
-use crate::console::keymap::Keymap;
+use crate::console::keymap::{Keymap, KeymapGroup};
 use crate::term::key::{Key, KeyCode, KeyMods, KeySpec};
 
 #[derive(Clone, Debug)]
@@ -226,13 +226,13 @@ impl KeymapConfig {
   pub fn build(&self) -> Keymap {
     let mut keymap = Keymap::new();
     for (key, event) in &self.keymap_tasks {
-      keymap.bind_p(*key, event.clone());
+      keymap.bind(KeymapGroup::Tasks, *key, event.clone());
     }
     for (key, event) in &self.keymap_term {
-      keymap.bind_t(*key, event.clone());
+      keymap.bind(KeymapGroup::Term, *key, event.clone());
     }
     for (key, event) in &self.keymap_copy {
-      keymap.bind_c(*key, event.clone());
+      keymap.bind(KeymapGroup::Copy, *key, event.clone());
     }
     keymap
   }

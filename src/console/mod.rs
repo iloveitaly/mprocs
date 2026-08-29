@@ -1,12 +1,11 @@
 pub mod action;
 pub mod app;
-pub mod app_client;
 pub mod app_layout;
+pub mod client;
 pub mod keymap;
 pub mod modal;
-pub mod server_message;
 pub mod state;
-pub mod task;
+pub mod task_view;
 pub mod ui_keymap;
 pub mod ui_tasks;
 pub mod ui_term;

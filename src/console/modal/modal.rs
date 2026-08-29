@@ -1,39 +1,29 @@
-use crate::console::{app::LoopAction, state::State};
-use crate::term::{Grid, TermEvent, grid::Rect};
+use crate::console::{action::Action, client::ClientId, keymap::Keymap};
+use crate::term::{Grid, grid::Rect, key::Key};
+
+pub enum ModalResult {
+  Keep,
+  Close,
+  /// Close the modal, then run the action.
+  Run(Action),
+}
 
 pub trait Modal: Send {
-  fn boxed(self) -> Box<dyn Modal>
-  where
-    Self: std::marker::Sized + 'static,
-  {
-    Box::new(self)
-  }
+  fn handle_key(&mut self, key: &Key, client_id: ClientId) -> ModalResult;
 
-  fn handle_input(
-    &mut self,
-    state: &mut State,
-    loop_action: &mut LoopAction,
-    event: &TermEvent,
-  ) -> bool;
+  fn size(&self) -> (u16, u16);
 
-  fn get_size(&mut self, frame_area: Rect) -> (u16, u16);
+  fn render(&mut self, grid: &mut Grid, keymap: &Keymap);
 
-  fn area(&mut self, frame_area: Rect) -> Rect {
-    let (w, h) = self.get_size(frame_area);
-
-    let y = frame_area.height.saturating_sub(h) / 2;
-    let x = frame_area.width.saturating_sub(w) / 2;
-
-    let w = w.min(frame_area.width);
-    let h = h.min(frame_area.height);
-
+  fn area(&self, frame: Rect) -> Rect {
+    let (w, h) = self.size();
+    let w = w.min(frame.width);
+    let h = h.min(frame.height);
     Rect {
-      x,
-      y,
+      x: (frame.width - w) / 2,
+      y: (frame.height - h) / 2,
       width: w,
       height: h,
     }
   }
-
-  fn render(&mut self, grid: &mut Grid);
 }

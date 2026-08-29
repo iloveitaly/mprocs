@@ -45,6 +45,14 @@ struct TimerRequest {
   delay: Duration,
 }
 
+/// Reports when the selected set goes between "some task active" and
+/// "none active". Backoff counts as active: the task is coming back.
+struct ActiveWatch {
+  selector: TaskSelector,
+  sender: UnboundedSender<bool>,
+  active: bool,
+}
+
 /// A command the kernel sent to a task, logged for the property harness.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,6 +89,10 @@ struct Graph {
   /// Effects reported by tasks during the current step; `settle` applies
   /// them one at a time, each against settled state.
   pending_effects: VecDeque<(TaskId, TaskEffect)>,
+  active_watches: Vec<ActiveWatch>,
+  /// Set whenever a task is added, removed or changes state; watches only
+  /// need re-checking then.
+  state_changed: bool,
   /// Every state transition, for the property harness to check against
   /// the legal state diagram.
   #[cfg(test)]
@@ -110,6 +122,8 @@ impl Graph {
       now: Instant::now(),
       pending_timers: Vec::new(),
       pending_effects: VecDeque::new(),
+      active_watches: Vec::new(),
+      state_changed: false,
       #[cfg(test)]
       transitions: Vec::new(),
       #[cfg(test)]
@@ -192,6 +206,7 @@ impl Graph {
       tags: def.tags,
     };
     self.tasks.insert(task_id, handle);
+    self.state_changed = true;
 
     for tag in tags {
       self.tags.entry(tag).or_default().insert(task_id);
@@ -233,8 +248,32 @@ impl Graph {
     false
   }
 
+  /// Subscribes and replays `Added` for every task already in scope.
   fn subscribe(&mut self, subscriber: TaskId, key: TaskKey, mode: SubMode) {
+    // Tasks the subscriber already hears about are not replayed again.
+    let replay: Vec<(TaskPath, TaskId)> = self
+      .ns
+      .in_scope(&key, mode)
+      .into_iter()
+      .filter(|(path, _)| !self.ns.is_subscribed(subscriber, &key.space, path))
+      .collect();
     self.ns.subscribe(subscriber, &key, mode);
+    for (path, id) in replay {
+      let t = &self.tasks[&id];
+      let notify = TaskNotify::Added {
+        path: Some(path.clone()),
+        label: t.label.clone(),
+        state: t.state,
+        vt: t.vt.clone(),
+      };
+      self.deliver(
+        id,
+        key.space.clone(),
+        Some(path),
+        notify,
+        HashSet::from([subscriber]),
+      );
+    }
   }
 
   fn unsubscribe(&mut self, subscriber: TaskId, key: TaskKey, mode: SubMode) {
@@ -260,6 +299,43 @@ impl Graph {
 
   fn take_timers(&mut self) -> Vec<TimerRequest> {
     std::mem::take(&mut self.pending_timers)
+  }
+
+  fn any_active(&self, selector: &TaskSelector) -> bool {
+    self.matching_ids(selector).into_iter().any(|id| {
+      let state = self.tasks[&id].state;
+      state.is_active() || state == TaskState::Backoff
+    })
+  }
+
+  fn watch_active(
+    &mut self,
+    selector: TaskSelector,
+    sender: UnboundedSender<bool>,
+  ) {
+    let active = self.any_active(&selector);
+    self.active_watches.push(ActiveWatch {
+      selector,
+      sender,
+      active,
+    });
+  }
+
+  fn check_active_watches(&mut self) {
+    if !self.state_changed {
+      return;
+    }
+    self.state_changed = false;
+    let mut watches = std::mem::take(&mut self.active_watches);
+    watches.retain_mut(|watch| {
+      let active = self.any_active(&watch.selector);
+      if active == watch.active {
+        return true;
+      }
+      watch.active = active;
+      watch.sender.send(active).is_ok()
+    });
+    self.active_watches = watches;
   }
 
   // ---- Intent ----
@@ -966,6 +1042,7 @@ impl Graph {
     task.state = state;
     task.epoch += 1;
     task.killed = false;
+    self.state_changed = true;
     let now_satisfied = task.is_satisfied();
     let space = task.space.clone();
     let path = task.path.clone();
@@ -1007,6 +1084,7 @@ impl Graph {
     let Some(mut handle) = self.tasks.remove(&task_id) else {
       return;
     };
+    self.state_changed = true;
     // Queued ids must be live when reconciliation drives them.
     if self.in_queue.remove(&task_id) {
       self.dirty.retain(|d| *d != task_id);
@@ -1441,6 +1519,7 @@ impl Kernel {
         break;
       }
       self.graph.settle();
+      self.graph.check_active_watches();
       for req in self.graph.take_timers() {
         let sender = self.sender.clone();
         tokio::spawn(async move {
@@ -1591,6 +1670,9 @@ impl Kernel {
       }
       KernelCommand::UnsubscribePath(path, mode) => {
         self.graph.unsubscribe(msg.from, path, mode);
+      }
+      KernelCommand::WatchActive(selector, sender) => {
+        self.graph.watch_active(selector, sender);
       }
     }
     false
@@ -3363,6 +3445,116 @@ mod tests {
       pc.query(KernelQuery::ResolvePath(key)).await.unwrap(),
       KernelQueryResponse::ResolvedPath(None)
     ));
+
+    pc.send(KernelCommand::Quit);
+    handle.await.unwrap();
+  }
+
+  #[tokio::test]
+  async fn active_watch_reports_transitions_only() {
+    let mut fx = Fixture::new();
+    let a = fx.add("a", path_def("a"));
+    let b = fx.add("b", path_def("b"));
+    let handle = fx.run();
+
+    let mut watch = fx
+      .pc
+      .watch_active(TaskSelector::All(TaskSpaceId::default_space()));
+    fx.flush().await;
+    assert!(watch.try_recv().is_err(), "no report without a transition");
+
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(b), None));
+    assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+    assert_eq!(fx.recv().await, ("b", RecordedCmd::Start));
+    assert_eq!(watch.recv().await, Some(true));
+
+    fx.pc.send(KernelCommand::Stop(TaskSelector::Id(a), None));
+    assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
+    fx.flush().await;
+    assert!(watch.try_recv().is_err(), "one task is still active");
+
+    fx.pc.send(KernelCommand::Stop(TaskSelector::Id(b), None));
+    assert_eq!(fx.recv().await, ("b", RecordedCmd::Stop));
+    assert_eq!(watch.recv().await, Some(false));
+
+    fx.quit(handle).await;
+  }
+
+  #[tokio::test]
+  async fn subscribe_replays_existing_tasks() {
+    let kernel = Kernel::new();
+    let pc = kernel.context();
+    let a = pc.register(
+      path_def("a"),
+      Box::new(|_| Box::new(super::super::task::TargetTask)),
+    );
+    let other = pc.register(
+      path_def("b/c"),
+      Box::new(|_| Box::new(super::super::task::TargetTask)),
+    );
+    let sibling = pc.register(
+      path_def("b/d"),
+      Box::new(|_| Box::new(super::super::task::TargetTask)),
+    );
+    let handle = tokio::spawn(kernel.run());
+
+    let (tx, mut rx) = unbounded_channel();
+    let (subscribed_tx, subscribed_rx) = tokio::sync::oneshot::channel();
+    let listener = pc.alloc_id();
+    let ack = pc.spawn_async_with_id(
+      listener,
+      TaskDef::default(),
+      move |pc, mut cmds| async move {
+        pc.subscribe_path(
+          TaskKey::default_space(TaskPath::new("b").unwrap()),
+          SubMode::Subtree,
+        );
+        pc.subscribe_path(
+          TaskKey::default_space(TaskPath::new("b/c").unwrap()),
+          SubMode::Exact,
+        );
+        pc.subscribe_path(
+          TaskKey::default_space(TaskPath::new("b").unwrap()),
+          SubMode::Subtree,
+        );
+        subscribed_tx.send(()).unwrap();
+        while let Some(cmd) = cmds.recv().await {
+          if let TaskCmd::Msg(msg) = cmd
+            && let Ok(n) = msg.downcast::<TaskNotification>()
+          {
+            tx.send((n.from, n.from_path)).unwrap();
+          }
+        }
+      },
+    );
+    assert!(ack.await.unwrap());
+    subscribed_rx.await.unwrap();
+    let flush =
+      pc.query(KernelQuery::ListTasks(TaskSpaceId::default_space(), None));
+    flush.await.unwrap();
+
+    let mut replayed = HashSet::new();
+    for _ in 0..2 {
+      replayed.insert(
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+          .await
+          .unwrap()
+          .unwrap(),
+      );
+    }
+    assert_eq!(
+      replayed,
+      HashSet::from([
+        (other, Some(TaskPath::new("b/c").unwrap())),
+        (sibling, Some(TaskPath::new("b/d").unwrap())),
+      ])
+    );
+    assert!(!replayed.iter().any(|(from, _)| *from == a));
+    assert!(
+      rx.try_recv().is_err(),
+      "overlapping and duplicate subscriptions must not replay tasks again"
+    );
 
     pc.send(KernelCommand::Quit);
     handle.await.unwrap();

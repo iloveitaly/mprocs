@@ -25,7 +25,7 @@ pub fn render_tasks(
   let active = state.scope == Scope::Tasks;
 
   grid.draw_block(
-    area.into(),
+    area,
     &if active {
       BorderType::Thick
     } else {
@@ -63,19 +63,17 @@ pub fn render_tasks(
 
   let range = state.tasks_list.visible_range();
   for (row, index) in range.enumerate() {
-    let task = if let Some(task) = state.tasks.get(index) {
-      task
-    } else {
+    let Some(task) = state.tasks.get(index) else {
       continue;
     };
 
     let selected = index == state.selected();
     let attrs = if selected {
-      Attrs::default().bg(crate::term::Color::Idx(240))
+      Attrs::default().bg(Color::Idx(240))
     } else {
       Attrs::default()
     };
-    let mut row_area = crate::term::grid::Rect {
+    let mut row_area = Rect {
       x: area.x + 1,
       y: area.y + 1 + row as u16,
       width: area.width.saturating_sub(2),
@@ -86,7 +84,7 @@ pub fn render_tasks(
     row_area.x += r.width;
     row_area.width = row_area.width.saturating_sub(r.width);
 
-    let r = grid.draw_text(row_area, task.name(), attrs);
+    let r = grid.draw_text(row_area, &task.name(), attrs);
     row_area.x += r.width;
     row_area.width = row_area.width.saturating_sub(r.width);
 
@@ -123,27 +121,11 @@ pub fn render_tasks(
   }
 }
 
-pub fn tasks_get_clicked_index(
-  area: Rect,
-  x: u16,
-  y: u16,
-  state: &State,
-) -> Option<usize> {
+/// Task index under a point inside the sidebar block.
+pub fn task_at(area: Rect, x: u16, y: u16, state: &State) -> Option<usize> {
   let inner = area.inner(1);
-  if tasks_check_hit(area, x, y) {
-    let index = y - inner.y;
-    let scroll = (state.selected() + 1).saturating_sub(inner.height as usize);
-    let index = index as usize + scroll;
-    if index < state.tasks.len() {
-      return Some(index);
-    }
+  if !inner.contains(x, y) {
+    return None;
   }
-  None
-}
-
-pub fn tasks_check_hit(area: Rect, x: u16, y: u16) -> bool {
-  area.x < x
-    && area.x + area.width > x + 1
-    && area.y < y
-    && area.y + area.height > y + 1
+  state.tasks_list.index_at((y - inner.y) as usize)
 }

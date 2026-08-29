@@ -851,9 +851,12 @@ impl Rect {
     self.x + self.width
   }
 
-  #[allow(dead_code)]
   pub fn bottom(&self) -> u16 {
     self.y + self.height
+  }
+
+  pub fn contains(&self, x: u16, y: u16) -> bool {
+    x >= self.x && x < self.right() && y >= self.y && y < self.bottom()
   }
 
   pub fn inner<T: Into<Margin>>(self, margin: T) -> Self {

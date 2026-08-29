@@ -5,13 +5,13 @@ use indexmap::IndexMap;
 use serde_yaml::Value;
 
 use crate::console::action::Action;
-use crate::console::task::{Sig, StopSignal};
 use crate::mprocs::{
   event::AppEvent,
   proc_log_config::LogConfig,
   settings::Settings,
   yaml_val::{Val, value_to_string},
 };
+use crate::task::process_task::{Sig, StopSignal};
 use crate::term::key::KeySpec;
 
 pub struct ConfigContext {

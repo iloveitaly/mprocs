@@ -115,6 +115,9 @@ impl TermDriver {
       let stdin_thread = std::thread::spawn(move || {
         let mut decoder = EventDecoder::new();
         let mut read_buf = [0u8; 1024];
+        // A lone ESC is only an Esc key press if nothing follows it
+        // shortly; escape sequences may be split across reads.
+        const ESC_TIMEOUT_MS: i32 = 25;
 
         loop {
           let mut poll_fds = [
@@ -130,8 +133,20 @@ impl TermDriver {
             },
           ];
 
+          let timeout = if decoder.esc_pending() {
+            ESC_TIMEOUT_MS
+          } else {
+            -1
+          };
           // Note: tty stdin can only be awaited with select/poll on Macos.
-          let poll_result = unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, -1) };
+          let poll_result =
+            unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, timeout) };
+          if poll_result == 0 {
+            decoder.flush(|event| {
+              let _ = sender.send(Ok(event));
+            });
+            continue;
+          }
           if poll_result < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
@@ -163,9 +178,6 @@ impl TermDriver {
             }
 
             decoder.feed(&read_buf[..n], |event| {
-              let _ = sender.send(Ok(event));
-            });
-            decoder.flush(|event| {
               let _ = sender.send(Ok(event));
             });
           }

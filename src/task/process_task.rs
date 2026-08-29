@@ -547,12 +547,19 @@ async fn send_key(
   key: Key,
   buf: &mut Vec<u8>,
 ) {
-  let application_cursor_keys = vt
+  // CSI-u only once the program asked for the supported kitty
+  // "disambiguate escape codes" flag.
+  let (csi_u, application_cursor_keys) = vt
     .read()
-    .map(|screen| screen.application_cursor())
-    .unwrap_or(false);
+    .map(|s| {
+      (
+        s.kitty_flags() != 0,
+        s.application_cursor(),
+      )
+    })
+    .unwrap_or((false, false));
   let modes = KeyEncodeModes {
-    enable_csi_u_key_encoding: true,
+    enable_csi_u_key_encoding: csi_u,
     application_cursor_keys,
     newline_mode: false,
   };

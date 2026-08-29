@@ -181,6 +181,9 @@ impl TaskScreen {
           match reply {
             Reply::PrimaryDeviceAttrs => emit::da1_reply(&mut seq),
             Reply::CursorPos { row, col } => emit::cpr(&mut seq, row, col),
+            Reply::KittyFlags(flags) => {
+              emit::kitty_flags_reply(&mut seq, flags)
+            }
           }
           effects.push(TaskScreenEffect::Write(seq));
         }
