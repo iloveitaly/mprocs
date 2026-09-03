@@ -4,6 +4,8 @@ use anyhow::anyhow;
 use rquickjs::CatchResultExt;
 use rquickjs::{AsyncContext, AsyncRuntime, Ctx, Module, Object, Persistent};
 
+use crate::runner::RunnerSpec;
+
 pub struct JsVm {
   #[allow(dead_code)]
   runtime: AsyncRuntime,
@@ -11,11 +13,17 @@ pub struct JsVm {
 }
 
 impl JsVm {
-  pub async fn new() -> anyhow::Result<Self> {
+  /// `runner` is the identity `std.dekit` calls act on; a standalone
+  /// script (run outside any project) passes `None` and simply fails
+  /// those calls lazily if it makes them.
+  pub async fn new(runner: Option<RunnerSpec>) -> anyhow::Result<Self> {
     let runtime = AsyncRuntime::new()?;
     let context = AsyncContext::full(&runtime).await?;
 
     rquickjs::async_with!(context => |ctx| {
+      if let Some(runner) = runner {
+        ctx.store_userdata(super::lib::dekit::RunnerStore(runner))?;
+      }
       super::lib::init(&ctx)
     })
     .await?;

@@ -6,7 +6,7 @@ use tokio::sync::oneshot::Receiver;
 use crate::{
   config::{
     config::Config,
-    task::{CmdConfig, TaskConfig, USER_TAG},
+    task::{CmdConfig, DYNAMIC_TAG, TaskConfig},
   },
   kernel::kernel_message::{
     Ack, KernelCommand, RegisterError, TaskContext, TaskSelector,
@@ -249,12 +249,20 @@ fn dispatch(
       tags,
     } => {
       let key = target.key().map_err(invalid_target)?;
-      if let CmdConfig::Cmd { cmd } = cmd
-        && cmd.is_empty()
-      {
-        return Err(CommandError::InvalidCommand(
-          "cmd must not be empty".to_string(),
-        ));
+      match cmd {
+        CmdConfig::Cmd { cmd } if cmd.is_empty() => {
+          return Err(CommandError::InvalidCommand(
+            "cmd must not be empty".to_string(),
+          ));
+        }
+        CmdConfig::Script { .. } if config.runner.is_none() => {
+          return Err(CommandError::InvalidCommand(
+            "script command has no runner identity".to_string(),
+          ));
+        }
+        CmdConfig::Cmd { .. }
+        | CmdConfig::Shell { .. }
+        | CmdConfig::Script { .. } => {}
       }
       let deps = deps
         .iter()
@@ -266,7 +274,7 @@ fn dispatch(
         cmd: Some(cmd.clone()),
         cwd: cwd.clone().map(Into::into),
         env: env.as_ref().map(|env| env.clone().into_iter().collect()),
-        tags: std::iter::once(USER_TAG.to_string())
+        tags: std::iter::once(DYNAMIC_TAG.to_string())
           .chain(tags.iter().cloned())
           .collect(),
         ..TaskConfig::default()
@@ -399,6 +407,21 @@ mod tests {
 
     assert!(matches!(
       execute(&pc, &config, &add("x", vec![])).await,
+      Err(CommandError::InvalidCommand(_))
+    ));
+    let script = Command::Add {
+      target: "script".parse().unwrap(),
+      label: None,
+      cmd: CmdConfig::Script {
+        script: "/tmp/script.js".into(),
+      },
+      cwd: None,
+      env: None,
+      deps: vec![],
+      tags: vec![],
+    };
+    assert!(matches!(
+      execute(&pc, &config, &script).await,
       Err(CommandError::InvalidCommand(_))
     ));
     assert!(matches!(

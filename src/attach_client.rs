@@ -10,32 +10,68 @@ use crate::term::TermEvent;
 use crate::term::key::{Key, KeyEventKind};
 use crate::term_driver::TermDriver;
 
+/// How an attach session came to an end.
+pub enum AttachEnd {
+  /// The client or runner closed the session; the task lives on.
+  Detached,
+  /// `until_exit`: the attached task's execution finished, with the
+  /// final state the runner reported in the bye.
+  TaskExited(Option<crate::protocol::RpcState>),
+}
+
 /// Attaches the local terminal to `target`'s screen until the session
 /// ends.
 pub async fn client_main(
   target: Target,
+  until_exit: bool,
   mut sender: ConnSender,
   mut receiver: ConnReceiver,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<AttachEnd> {
   client_handshake(&mut sender, &mut receiver).await?;
 
   let mut term_driver = TermDriver::create()?;
-  let result = client_loop(&mut term_driver, target, sender, receiver).await;
+  let result =
+    client_loop(&mut term_driver, target, until_exit, sender, receiver).await;
+  // Drop first: leaving the alternate screen restores the main screen,
+  // so a foreground run's final output must be reprinted afterward to
+  // survive on it.
   drop(term_driver);
-  result
+  match result? {
+    LoopEnd::Detached => Ok(AttachEnd::Detached),
+    LoopEnd::TaskExited { state, screen } => {
+      if let Some(screen) = screen {
+        use std::io::Write;
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(screen.as_bytes());
+        let _ = stdout.write_all(b"\n");
+        let _ = stdout.flush();
+      }
+      Ok(AttachEnd::TaskExited(state))
+    }
+  }
+}
+
+enum LoopEnd {
+  Detached,
+  TaskExited {
+    state: Option<crate::protocol::RpcState>,
+    screen: Option<String>,
+  },
 }
 
 async fn client_loop(
   term_driver: &mut TermDriver,
   target: Target,
+  until_exit: bool,
   mut sender: ConnSender,
   mut receiver: ConnReceiver,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<LoopEnd> {
   let size = term_driver.size()?;
   let (method, params) = RpcRequest::Attach {
     target,
     width: size.width,
     height: size.height,
+    until_exit,
   }
   .to_wire();
   sender
@@ -75,10 +111,17 @@ async fn client_loop(
             if bye.code == codes::QUIT {
               break;
             }
-            bail!("server closed the session: {}", bye.code);
+            if bye.code == codes::TASK_EXITED {
+              let _ = stdout.flush().await;
+              return Ok(LoopEnd::TaskExited {
+                state: bye.state,
+                screen: bye.screen,
+              });
+            }
+            bail!("runner closed the session: {}", bye.code);
           }
           msg @ (CtlMsg::Hello(_) | CtlMsg::Request(_) | CtlMsg::Event(_)) => {
-            log::debug!("ignoring server message {msg:?}");
+            log::debug!("ignoring runner message {msg:?}");
           }
         },
         Some(Err(err)) => return Err(err),
@@ -104,5 +147,5 @@ async fn client_loop(
 
   let _ = stdout.flush().await;
 
-  Ok(())
+  Ok(LoopEnd::Detached)
 }

@@ -1,3 +1,4 @@
+pub(crate) mod dekit;
 mod env;
 mod fs;
 mod log;
@@ -15,6 +16,7 @@ pub fn init(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
   register_lazy(&obj, "fs", fs::init)?;
   register_lazy(&obj, "path", path::init)?;
   register_lazy(&obj, "env", env::init)?;
+  register_lazy(&obj, "dekit", dekit::init)?;
   register_lazy(&obj, "process", process::init)?;
   register_lazy(&obj, "tui", tui::init)?;
 

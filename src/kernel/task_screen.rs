@@ -626,6 +626,14 @@ impl TaskScreen {
         y_px: 0,
       })
       .unwrap_or(self.size);
+    // An observer on a degenerate terminal (0 rows or columns) must not
+    // shrink the vt to nothing: the grid needs at least one cell.
+    let size = Winsize {
+      x: size.x.max(1),
+      y: size.y.max(1),
+      x_px: 0,
+      y_px: 0,
+    };
     if size == self.size {
       return false;
     }

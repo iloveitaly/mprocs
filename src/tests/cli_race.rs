@@ -1,4 +1,4 @@
-//! Concurrent-CLI races against one daemon: two clients hitting the same
+//! Concurrent-CLI races against one runner: two clients hitting the same
 //! verb must see exactly-one-winner (spawn) or only well-defined replies
 //! (start under churn), never internal errors.
 
@@ -30,25 +30,33 @@ impl Drop for TmpDir {
   }
 }
 
-/// One isolated daemon: its own working dir and runtime dir.
-struct Daemon {
+/// One isolated runner: its own working dir and runtime dir.
+struct TestRunner {
   work: TmpDir,
   runtime: TmpDir,
 }
 
-impl Daemon {
-  fn start(name: &str) -> Self {
-    let daemon = Daemon {
+impl TestRunner {
+  fn new(name: &str) -> Self {
+    TestRunner {
       work: TmpDir::new(&format!("{}w", name)),
       runtime: TmpDir::new(&format!("{}r", name)),
-    };
-    let out = daemon.run(&["server", "start"]);
+    }
+  }
+
+  fn start(name: &str) -> Self {
+    let runner = TestRunner::new(name);
+    runner.start_runner();
+    runner
+  }
+
+  fn start_runner(&self) {
+    let out = self.run(&["runner", "start"]);
     assert!(
       out.status.success(),
-      "server start failed: {}",
+      "runner start failed: {}",
       String::from_utf8_lossy(&out.stderr)
     );
-    daemon
   }
 
   fn cmd(&self, args: &[&str]) -> Command {
@@ -57,7 +65,9 @@ impl Daemon {
       .arg("-C")
       .arg(&self.work.path)
       .args(args)
-      .env("XDG_RUNTIME_DIR", &self.runtime.path);
+      .env("XDG_RUNTIME_DIR", &self.runtime.path)
+      .env("XDG_CONFIG_HOME", &self.runtime.path)
+      .env("XDG_DATA_HOME", &self.runtime.path);
     cmd
   }
 
@@ -75,10 +85,10 @@ impl Daemon {
   }
 
   fn stop(&self) {
-    let out = self.run(&["server", "stop"]);
+    let out = self.run(&["runner", "stop"]);
     assert!(
       out.status.success(),
-      "server stop failed: {}",
+      "runner stop failed: {}",
       String::from_utf8_lossy(&out.stderr)
     );
   }
@@ -97,7 +107,7 @@ fn assert_dir_has_no_lock(runtime: &Path) {
       .collect();
     assert!(
       leftover.is_empty(),
-      "daemon files left behind: {:?}",
+      "runner files left behind: {:?}",
       leftover
     );
   }
@@ -105,10 +115,10 @@ fn assert_dir_has_no_lock(runtime: &Path) {
 
 #[test]
 fn spawn_race_has_exactly_one_winner() {
-  let daemon = Daemon::start("sr");
+  let runner = TestRunner::start("sr");
 
-  let a = daemon.spawn(&["spawn", "same", "--", "sleep", "30"]);
-  let b = daemon.spawn(&["spawn", "same", "--", "sleep", "30"]);
+  let a = runner.spawn(&["spawn", "same", "--", "sleep", "30"]);
+  let b = runner.spawn(&["spawn", "same", "--", "sleep", "30"]);
   let outs = [a.wait_with_output().unwrap(), b.wait_with_output().unwrap()];
 
   let winners = outs.iter().filter(|o| o.status.success()).count();
@@ -127,18 +137,18 @@ fn spawn_race_has_exactly_one_winner() {
     stderr_of(loser)
   );
 
-  daemon.stop();
-  assert_dir_has_no_lock(&daemon.runtime.path);
+  runner.stop();
+  assert_dir_has_no_lock(&runner.runtime.path);
 }
 
 #[test]
 fn start_races_spawn_and_down_without_internal_errors() {
-  let daemon = Daemon::start("ch");
+  let runner = TestRunner::start("ch");
 
   for i in 0..10 {
     let path = format!("x/{}", i);
-    let spawner = daemon.spawn(&["spawn", &path, "--", "sleep", "30"]);
-    let starter = daemon.spawn(&["start", "x/*"]);
+    let spawner = runner.spawn(&["spawn", &path, "--", "sleep", "30"]);
+    let starter = runner.spawn(&["start", "x/*"]);
 
     let spawn_out = spawner.wait_with_output().unwrap();
     assert!(
@@ -157,7 +167,7 @@ fn start_races_spawn_and_down_without_internal_errors() {
       stderr_of(&start_out)
     );
 
-    let stop_out = daemon.run(&["stop", "x/*"]);
+    let stop_out = runner.run(&["stop", "x/*"]);
     assert!(
       stop_out.status.success(),
       "stop failed: {}",
@@ -165,9 +175,98 @@ fn start_races_spawn_and_down_without_internal_errors() {
     );
   }
 
-  // The daemon survived the churn.
-  let ls = daemon.run(&["ls"]);
+  // The runner survived the churn.
+  let ls = runner.run(&["ls"]);
   assert!(ls.status.success(), "ls failed: {}", stderr_of(&ls));
 
-  daemon.stop();
+  runner.stop();
+}
+
+#[test]
+fn live_runner_ignores_a_broken_kernel_pin() {
+  let runner = TestRunner::start("pin");
+  std::fs::write(
+    runner.work.path.join("dekit.yaml"),
+    "kernel: {path: missing-dekit}\n",
+  )
+  .unwrap();
+
+  let ls = runner.run(&["ls"]);
+  assert!(ls.status.success(), "ls failed: {}", stderr_of(&ls));
+  let status = runner.run(&["runner", "status"]);
+  assert!(
+    status.status.success(),
+    "status failed: {}",
+    stderr_of(&status)
+  );
+  assert!(
+    String::from_utf8_lossy(&status.stdout).contains("Kernel selection error")
+  );
+  runner.stop();
+}
+
+#[test]
+fn startup_reports_config_errors() {
+  let runner = TestRunner::new("err");
+  std::fs::write(
+    runner.work.path.join("dekit.yaml"),
+    "unknown_setting: true\n",
+  )
+  .unwrap();
+
+  let output = runner.run(&["runner", "start"]);
+  let error = stderr_of(&output);
+  assert!(!output.status.success());
+  assert!(error.contains("unknown_setting"), "wrong error: {error}");
+  assert!(
+    !error.contains("did not become ready"),
+    "wrong error: {error}"
+  );
+}
+
+#[test]
+fn script_task_controls_its_runner() {
+  let runner = TestRunner::new("js");
+  let script_cwd = TmpDir::new("jscwd");
+  std::fs::write(
+    runner.work.path.join("dekit.yaml"),
+    format!(
+      "tasks:\n  worker:\n    cmd: [sleep, '30']\n  workflow:\n    script: workflow.js\n    cwd: '{}'\n",
+      script_cwd.path.display()
+    ),
+  )
+  .unwrap();
+  std::fs::write(
+    runner.work.path.join("workflow.js"),
+    "export async function main() { return await std.dekit.start('worker') }\n",
+  )
+  .unwrap();
+  runner.start_runner();
+
+  let start = runner.run(&["start", "workflow"]);
+  assert!(
+    start.status.success(),
+    "script failed: {}",
+    stderr_of(&start)
+  );
+
+  let mut running = false;
+  for _ in 0..40 {
+    let output = runner.run(&["ls", "worker"]);
+    assert!(output.status.success(), "ls failed: {}", stderr_of(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.contains("running") || stdout.contains("ready") {
+      running = true;
+      break;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+  }
+  let workflow = runner.run(&["screen", "workflow"]);
+  assert!(
+    running,
+    "script did not start worker: {}{}",
+    String::from_utf8_lossy(&workflow.stdout),
+    stderr_of(&workflow),
+  );
+  runner.stop();
 }

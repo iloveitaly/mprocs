@@ -36,7 +36,7 @@ impl Modal for QuitModal {
     let inner = area.inner(1);
     grid.fill_area(inner, ' ', Attrs::default());
     let lines = [
-      "<e>   - exit client and server",
+      "<e>   - exit client and runner",
       "<d>   - detach client",
       "<Esc> - cancel",
     ];

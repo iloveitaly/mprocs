@@ -1,18 +1,16 @@
-use std::path::Path;
-
 use anyhow::bail;
 use serde_json::Value;
 
-use crate::daemon::socket::connect_client_socket;
 use crate::protocol::{CtlMsg, Request, RpcRequest, client_handshake};
+use crate::runner::{RunnerSpec, socket::connect_client_socket};
 
 pub async fn rpc_request(
-  working_dir: &Path,
+  runner: &RunnerSpec,
   req: RpcRequest,
-  spawn_server: bool,
+  start_runner: bool,
 ) -> anyhow::Result<Value> {
   let (mut sender, mut receiver) =
-    connect_client_socket(working_dir, spawn_server).await?;
+    connect_client_socket(runner, start_runner).await?;
   client_handshake(&mut sender, &mut receiver).await?;
 
   let (method, params) = req.to_wire();
@@ -35,9 +33,9 @@ pub async fn rpc_request(
           None => return Ok(response.result.unwrap_or(Value::Null)),
         }
       }
-      CtlMsg::Bye(bye) => bail!("daemon closed the connection: {}", bye.code),
+      CtlMsg::Bye(bye) => bail!("runner closed the connection: {}", bye.code),
       msg @ (CtlMsg::Hello(_) | CtlMsg::Request(_) | CtlMsg::Event(_)) => {
-        log::debug!("ignoring daemon message {msg:?}");
+        log::debug!("ignoring runner message {msg:?}");
       }
     }
   }

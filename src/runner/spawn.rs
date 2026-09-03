@@ -1,14 +1,23 @@
 use std::path::Path;
 
-pub fn spawn_server_daemon(working_dir: &Path) -> anyhow::Result<()> {
-  let exe = std::env::current_exe()?;
-  let canonical_dir = dunce::canonicalize(working_dir)?;
-  let dir_str = canonical_dir.to_string_lossy().into_owned();
+use crate::runner::RunnerSpec;
+
+pub fn spawn_runner(
+  runner: &RunnerSpec,
+  executable: &Path,
+) -> anyhow::Result<()> {
+  let exe = dunce::canonicalize(executable)?;
+  let dir_str = runner
+    .root
+    .to_str()
+    .expect("validated runner root")
+    .to_string();
+  let kind = runner.kind.as_str();
 
   #[cfg(unix)]
-  return self::unix::spawn_impl(exe, &dir_str);
+  return self::unix::spawn_impl(exe, &dir_str, kind);
   #[cfg(windows)]
-  return self::windows::spawn_impl(exe, &dir_str);
+  return self::windows::spawn_impl(exe, &dir_str, kind);
 }
 
 #[cfg(unix)]
@@ -17,21 +26,32 @@ mod unix {
 
   use anyhow::bail;
 
-  pub fn spawn_impl(exe: PathBuf, dir: &str) -> anyhow::Result<()> {
-    let daemon =
-      daemonize::Daemonize::new().working_directory(std::env::current_dir()?);
+  pub fn spawn_impl(exe: PathBuf, dir: &str, kind: &str) -> anyhow::Result<()> {
+    let process = daemonize::Daemonize::new().working_directory(dir);
 
-    match daemon.execute() {
+    match process.execute() {
       daemonize::Outcome::Parent(_) => (),
-      daemonize::Outcome::Child(_) => exec(&[
-        exe.to_str().ok_or_else(|| {
-          anyhow::format_err!("Failed to convert exe path: {:?}", exe)
-        })?,
-        "server",
-        "run",
-        "--dir",
-        dir,
-      ])?,
+      daemonize::Outcome::Child(_) => {
+        // daemonize double-forks, so this process is in a session led
+        // by its exited intermediate parent. Take a session of our own:
+        // every task inherits it, which lets a force-stop reap the
+        // whole tree by session membership. Failure just leaves the
+        // reap guard (`sid == pid`) off.
+        unsafe {
+          libc::setsid();
+        }
+        exec(&[
+          exe.to_str().ok_or_else(|| {
+            anyhow::format_err!("Failed to convert exe path: {:?}", exe)
+          })?,
+          "runner",
+          "run",
+          "--dir",
+          dir,
+          "--kind",
+          kind,
+        ])?
+      }
     }
 
     Ok(())
@@ -77,11 +97,16 @@ mod windows {
     CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
   };
 
-  pub fn spawn_impl(path: PathBuf, dir: &str) -> anyhow::Result<()> {
+  pub fn spawn_impl(
+    path: PathBuf,
+    dir: &str,
+    kind: &str,
+  ) -> anyhow::Result<()> {
     use std::{os::windows::process::CommandExt, process::Stdio};
 
     std::process::Command::new(path)
-      .args(["server", "run", "--dir", dir])
+      .args(["runner", "run", "--dir", dir, "--kind", kind])
+      .current_dir(dir)
       .stdin(Stdio::null())
       .stdout(Stdio::null())
       .stderr(Stdio::null())

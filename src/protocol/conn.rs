@@ -134,8 +134,8 @@ pub async fn client_handshake(
     CtlMsg::Hello(hello) => {
       if hello.protocol != PROTOCOL_VERSION {
         bail!(
-          "daemon ({}) speaks protocol {}, this binary speaks {}; \
-           restart it with `dekit server stop && dekit up`",
+          "runner ({}) speaks protocol {}, this binary speaks {}; \
+           restart it with `dekit runner stop && dekit up`",
           hello.app,
           hello.protocol,
           PROTOCOL_VERSION,
@@ -143,8 +143,8 @@ pub async fn client_handshake(
       }
       Ok(hello)
     }
-    CtlMsg::Bye(bye) => bail!("daemon refused connection: {}", bye_text(&bye)),
-    msg => bail!("expected hello from daemon, got {msg:?}"),
+    CtlMsg::Bye(bye) => bail!("runner refused connection: {}", bye_text(&bye)),
+    msg => bail!("expected hello from runner, got {msg:?}"),
   }
 }
 
@@ -158,9 +158,11 @@ pub async fn server_handshake(
         let bye = Bye {
           code: codes::UNSUPPORTED_PROTOCOL.to_string(),
           message: format!(
-            "daemon speaks protocol {}, client ({}) speaks {}",
+            "runner speaks protocol {}, client ({}) speaks {}",
             PROTOCOL_VERSION, hello.app, hello.protocol,
           ),
+          state: None,
+          screen: None,
         };
         let _ = sender.send_ctl(CtlMsg::Bye(bye)).await;
         bail!(

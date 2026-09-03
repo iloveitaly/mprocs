@@ -24,7 +24,7 @@ pub enum Target {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Runner {
-  /// Built-in (`user`, `project`, `cloud`) or user alias.
+  /// Built-in (`host`, `project`, `cloud`) or user alias.
   Name(String),
   /// `/abs`, `~/rel`, or `./rel`: a local project runner.
   Path(String),
@@ -176,7 +176,7 @@ impl FromStr for Target {
   }
 }
 
-fn parse_runner(runner: &str) -> Result<Runner, InvalidTarget> {
+pub fn parse_runner(runner: &str) -> Result<Runner, InvalidTarget> {
   if runner.is_empty() {
     return Err(InvalidTarget("runner is empty".to_string()));
   }
@@ -272,7 +272,7 @@ mod tests {
     for s in [
       "tmp/proc1",
       "+dev",
-      "user::emacs-server",
+      "host::emacs-server",
       "project::@dekit/console",
       "prod::+ci",
       "~/dev/proj::web/*",
@@ -297,8 +297,8 @@ mod tests {
   #[test]
   fn runner_kinds() {
     assert_eq!(
-      parse("user::a").runner(),
-      Some(&Runner::Name("user".into()))
+      parse("host::a").runner(),
+      Some(&Runner::Name("host".into()))
     );
     assert_eq!(parse("/p::a").runner(), Some(&Runner::Path("/p".into())));
     assert_eq!(parse("./p::a").runner(), Some(&Runner::Path("./p".into())));
@@ -338,7 +338,7 @@ mod tests {
       parse("@*/app").selector(),
       Ok(TaskSelector::Glob(SpaceSelector::Any, pattern)) if pattern == "app"
     ));
-    assert!(parse("user::a").selector().is_err());
+    assert!(parse("host::a").selector().is_err());
     assert_eq!(
       parse("@dekit/console").key().unwrap(),
       TaskKey::new(TaskSpaceId::dekit(), TaskPath::new("console").unwrap())

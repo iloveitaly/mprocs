@@ -4,7 +4,10 @@ use crate::{
   dekit::server::resolve_screen,
   kernel::{
     copy_mode::CopyMove,
-    kernel_message::{SharedVt, TaskContext},
+    kernel_message::{
+      KernelCommand, KernelQuery, KernelQueryResponse, SharedVt, TaskContext,
+      TaskSelector,
+    },
     task::TaskId,
     task_screen::{ObserverId, ScreenNotify, ScrollUnit, TaskScreenCmd},
   },
@@ -22,6 +25,7 @@ pub async fn attach_session(
   request_id: u64,
   target: Target,
   size: Size,
+  until_exit: bool,
   mut sender: ConnSender,
   mut receiver: ConnReceiver,
 ) {
@@ -55,13 +59,27 @@ pub async fn attach_session(
         false
       }
     };
+  let mut end = SessionEnd::Closed;
   if confirmed {
-    session(
+    let mut until = None;
+    let mut ended = false;
+    if until_exit {
+      // The watch is registered before the state query and both go
+      // through the one kernel queue, so an exit is never missed:
+      // either the query already sees it or the watch reports it.
+      until = Some(pc.watch_active(TaskSelector::Id(task.id)));
+      ended = !kernel_task_state(pc, task.id)
+        .await
+        .is_some_and(|state| state.is_active());
+    }
+    end = session(
       pc,
       task.id,
       observer,
-      vt,
+      &vt,
       notifies,
+      until,
+      ended,
       &mut sender,
       &mut receiver,
     )
@@ -70,12 +88,64 @@ pub async fn attach_session(
   // Whatever ended the session, the screen must not keep our geometry.
   pc.send_msg(task.id, TaskScreenCmd::Detach { observer });
   if confirmed {
-    let _ = sender
-      .send_ctl(CtlMsg::Bye(Bye {
+    let bye = match end {
+      SessionEnd::TaskExited => {
+        // Capture the final state and screen before reaping the task.
+        let state = kernel_task_state(pc, task.id)
+          .await
+          .map(crate::dekit::server::task_state);
+        let screen = final_screen_text(&vt);
+        // A foreground `run` (the only `until_exit` caller) owns its
+        // task; the runner reaps it here so a client that dies before
+        // it could ask can never leak the task.
+        pc.send(KernelCommand::Remove(TaskSelector::Id(task.id), None));
+        Bye {
+          code: codes::TASK_EXITED.to_string(),
+          message: String::new(),
+          state,
+          screen,
+        }
+      }
+      SessionEnd::Closed => Bye {
         code: codes::QUIT.to_string(),
         message: String::new(),
-      }))
-      .await;
+        state: None,
+        screen: None,
+      },
+    };
+    let _ = sender.send_ctl(CtlMsg::Bye(bye)).await;
+  }
+}
+
+/// The task's final screen as ANSI text, trailing blank space trimmed,
+/// or `None` if it is empty.
+fn final_screen_text(vt: &SharedVt) -> Option<String> {
+  let screen = vt.read().ok()?;
+  let text = crate::term::ansi::render_screen_ansi(&screen);
+  let trimmed = text.trim_end_matches(['\n', '\r', ' ']);
+  if trimmed.is_empty() {
+    None
+  } else {
+    Some(trimmed.to_string())
+  }
+}
+
+enum SessionEnd {
+  /// The client went away or closed the session.
+  Closed,
+  /// `until_exit`: the attached task's execution finished.
+  TaskExited,
+}
+
+async fn kernel_task_state(
+  pc: &TaskContext,
+  id: TaskId,
+) -> Option<crate::kernel::task::TaskState> {
+  match pc.query(KernelQuery::ListTasks(TaskSelector::Id(id))).await {
+    Ok(KernelQueryResponse::TaskList(tasks)) => {
+      tasks.into_iter().next().map(|task| task.state)
+    }
+    Ok(KernelQueryResponse::Explain(_)) | Err(_) => None,
   }
 }
 
@@ -83,21 +153,40 @@ async fn session(
   pc: &TaskContext,
   task: TaskId,
   observer: ObserverId,
-  vt: SharedVt,
+  vt: &SharedVt,
   mut notifies: UnboundedReceiver<ScreenNotify>,
+  mut until: Option<UnboundedReceiver<bool>>,
+  mut ended: bool,
   sender: &mut ConnSender,
   receiver: &mut ConnReceiver,
-) {
+) -> SessionEnd {
   let mut differ = ScreenDiffer::new();
   // Copy-mode surface, painted instead of `vt` while set.
   let mut present: Option<SharedVt> = None;
   let mut title = String::new();
   let mut batch = Vec::new();
   loop {
+    if ended {
+      // The task reports its exit only after its output reached the
+      // vt, so painting now shows the complete final screen even if
+      // render notifies are still queued.
+      let mut out = Vec::new();
+      render(&mut differ, vt, &present, &mut title, &mut out);
+      if !out.is_empty() {
+        let _ = sender.send_out(out.into()).await;
+      }
+      return SessionEnd::TaskExited;
+    }
+    let exit_watch = async {
+      match until.as_mut() {
+        Some(watch) => watch.recv().await,
+        None => std::future::pending().await,
+      }
+    };
     tokio::select! {
       n = notifies.recv_many(&mut batch, 256) => {
         if n == 0 {
-          return;
+          return SessionEnd::Closed;
         }
         let mut paint = false;
         let mut out = Vec::new();
@@ -117,20 +206,19 @@ async fn session(
           }
         }
         if paint {
-          if let Ok(screen) = vt.read()
-            && screen.title() != title
-          {
-            title = screen.title().to_string();
-            emit::osc_title(&mut out, &title);
-          }
-          if let Ok(screen) = present.as_ref().unwrap_or(&vt).read() {
-            differ.diff(&mut out, &*screen);
-          }
+          render(&mut differ, vt, &present, &mut title, &mut out);
         }
         if !out.is_empty() && sender.send_out(out.into()).await.is_err() {
-          return;
+          return SessionEnd::Closed;
         }
       }
+      active = exit_watch => match active {
+        Some(true) => {}
+        Some(false) => ended = true,
+        // The watch channel closes only when the kernel is shutting
+        // down — that is a session close, not a task exit.
+        None => return SessionEnd::Closed,
+      },
       msg = receiver.recv() => match msg {
         Some(Ok(Msg::Ctl(CtlMsg::Event(event)))) if event.name == EVENT_INPUT => {
           match serde_json::from_value::<TermEvent>(event.params) {
@@ -149,11 +237,29 @@ async fn session(
         Some(Ok(msg)) => log::debug!("attach: ignoring {msg:?}"),
         Some(Err(err)) => {
           log::debug!("attach: closing: {err}");
-          return;
+          return SessionEnd::Closed;
         }
-        None => return,
+        None => return SessionEnd::Closed,
       },
     }
+  }
+}
+
+fn render(
+  differ: &mut ScreenDiffer,
+  vt: &SharedVt,
+  present: &Option<SharedVt>,
+  title: &mut String,
+  out: &mut Vec<u8>,
+) {
+  if let Ok(screen) = vt.read()
+    && screen.title() != *title
+  {
+    *title = screen.title().to_string();
+    emit::osc_title(out, title);
+  }
+  if let Ok(screen) = present.as_ref().unwrap_or(vt).read() {
+    differ.diff(out, &*screen);
   }
 }
 
@@ -246,6 +352,7 @@ mod tests {
     pc: &TaskContext,
     config: &Arc<Config>,
     target: &str,
+    until_exit: bool,
   ) -> (ConnSender, ConnReceiver, tokio::task::JoinHandle<()>) {
     let (client, server) = duplex(64 * 1024);
     let (client_read, client_write) = tokio::io::split(client);
@@ -263,6 +370,7 @@ mod tests {
       target: target.parse().unwrap(),
       width: 80,
       height: 24,
+      until_exit,
     }
     .to_wire();
     sender
@@ -298,6 +406,55 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn until_exit_ends_the_attach_when_the_task_is_not_active() {
+    use crate::{
+      process::process_spec::ProcessSpec,
+      protocol::codes,
+      task::process_task::{ProcessTaskConfig, process_task_registration},
+    };
+
+    let config = Arc::new(Config::make_default());
+    let mut kernel = Kernel::new();
+    let pc = kernel.context();
+    let spec = ProcessSpec::from_argv(vec![
+      "sh".to_string(),
+      "-c".to_string(),
+      "true".to_string(),
+    ]);
+    // Never started: the task sits Idle, which `until_exit` treats as
+    // already finished.
+    kernel
+      .register_task_registration(process_task_registration(
+        pc.alloc_id(),
+        Some(TaskKey::default_space(TaskPath::new("oneshot").unwrap())),
+        ProcessTaskConfig {
+          pinned: false,
+          ..ProcessTaskConfig::new(spec)
+        },
+      ))
+      .unwrap();
+    let kernel_handle = tokio::spawn(kernel.run());
+
+    let (sender, mut receiver, session) =
+      attach(&pc, &config, "oneshot", true).await;
+
+    let bye = timeout(Duration::from_secs(2), async {
+      loop {
+        match receiver.recv().await {
+          Some(Ok(Msg::Ctl(CtlMsg::Bye(bye)))) => return Some(bye.code),
+          Some(Ok(_)) => (),
+          Some(Err(_)) | None => return None,
+        }
+      }
+    })
+    .await
+    .unwrap();
+    assert_eq!(bye.as_deref(), Some(codes::TASK_EXITED));
+
+    finish(pc, sender, receiver, session, kernel_handle).await;
+  }
+
+  #[tokio::test]
   async fn attaches_to_the_console_and_forwards_input() {
     let config = Arc::new(Config::make_default());
     let keymap = config.keymap.build();
@@ -319,7 +476,7 @@ mod tests {
     let kernel_handle = tokio::spawn(kernel.run());
 
     let (mut sender, mut receiver, session) =
-      attach(&pc, &config, "@dekit/console").await;
+      attach(&pc, &config, "@dekit/console", false).await;
 
     // The console paints its sidebar once attached.
     assert!(wait_for(&mut receiver, b"Tasks").await);
@@ -363,7 +520,7 @@ mod tests {
     let kernel_handle = tokio::spawn(kernel.run());
 
     let (mut sender, mut receiver, session) =
-      attach(&pc, &config, "@dekit/console").await;
+      attach(&pc, &config, "@dekit/console", false).await;
     assert!(wait_for(&mut receiver, b"Tasks").await);
 
     sender
@@ -393,7 +550,7 @@ mod tests {
     drop(receiver);
 
     let (sender, mut receiver, session) =
-      attach(&pc, &config, "@dekit/console").await;
+      attach(&pc, &config, "@dekit/console", false).await;
     assert!(wait_for(&mut receiver, b"Tasks").await);
     finish(pc, sender, receiver, session, kernel_handle).await;
   }
@@ -427,7 +584,7 @@ mod tests {
     let kernel_handle = tokio::spawn(kernel.run());
 
     let (mut sender, mut receiver, session) =
-      attach(&pc, &config, "echo").await;
+      attach(&pc, &config, "echo", false).await;
     assert!(wait_for(&mut receiver, b"hello-copy").await);
 
     // Select the first cell of the top row and yank it: OSC 52 comes back.

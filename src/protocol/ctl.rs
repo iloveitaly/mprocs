@@ -67,6 +67,15 @@ pub struct Bye {
   pub code: String,
   #[serde(default, skip_serializing_if = "String::is_empty")]
   pub message: String,
+  /// `task_exited` byes carry the task's final state, so a foreground
+  /// client needs no follow-up query for the exit code.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub state: Option<crate::protocol::rpc::RpcState>,
+  /// `task_exited` byes carry the task's final screen as ANSI text, so a
+  /// foreground client can reprint it onto the main screen after leaving
+  /// the alternate screen (which the terminal would otherwise restore).
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub screen: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -132,6 +141,8 @@ pub mod codes {
   pub const INTERNAL: &str = "internal";
   pub const UNSUPPORTED_PROTOCOL: &str = "unsupported_protocol";
   pub const QUIT: &str = "quit";
+  /// Attach-with-`until_exit` bye: the attached task's execution ended.
+  pub const TASK_EXITED: &str = "task_exited";
 }
 
 /// Client-to-server event carrying a terminal input event.
@@ -214,6 +225,8 @@ mod tests {
         CtlMsg::Bye(Bye {
           code: codes::QUIT.to_string(),
           message: String::new(),
+          state: None,
+          screen: None,
         }),
         r#"{"type":"bye","code":"quit"}"#,
       ),
@@ -221,8 +234,23 @@ mod tests {
         CtlMsg::Bye(Bye {
           code: codes::UNSUPPORTED_PROTOCOL.to_string(),
           message: "speak 1".to_string(),
+          state: None,
+          screen: None,
         }),
         r#"{"type":"bye","code":"unsupported_protocol","message":"speak 1"}"#,
+      ),
+      (
+        CtlMsg::Bye(Bye {
+          code: codes::TASK_EXITED.to_string(),
+          message: String::new(),
+          state: Some(crate::protocol::rpc::RpcState {
+            state: "exited".to_string(),
+            exit_code: Some(3),
+            signal: None,
+          }),
+          screen: Some("build ok".to_string()),
+        }),
+        r#"{"type":"bye","code":"task_exited","state":{"state":"exited","exit_code":3},"screen":"build ok"}"#,
       ),
     ]
   }
@@ -253,6 +281,8 @@ mod tests {
       CtlMsg::Bye(Bye {
         code: "quit".to_string(),
         message: String::new(),
+        state: None,
+        screen: None,
       })
     );
   }

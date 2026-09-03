@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::task::JoinSet;
@@ -10,7 +10,6 @@ use crate::{
     hook::{Hook, watch_idle},
   },
   console::app::console_task_registration,
-  daemon::{lockfile, socket::bind_server_socket},
   dekit::attach::attach_session,
   kernel::{
     kernel::Kernel,
@@ -27,19 +26,32 @@ use crate::{
     RpcState, RpcTaskInfo, RpcWhy, RpcWhyDep, ScreenResult, TaskListResult,
     codes, ok_result, server_handshake,
   },
+  runner::{RunnerSpec, lockfile, socket::bind_server_socket},
   target::Target,
   task::config_tasks::register_config_tasks,
   term::Size,
 };
 
 pub async fn run_server(
-  working_dir: PathBuf,
+  runner: RunnerSpec,
   log_level: Option<&str>,
 ) -> anyhow::Result<()> {
-  let (config, load_err) = match Config::load_dir(&working_dir) {
-    Ok(config) => (config, None),
-    Err(err) => (Config::make_default(), Some(err)),
-  };
+  let lock_guard = lockfile::create_lock_file(&runner)?;
+  let result = run_locked(&runner, log_level, &lock_guard).await;
+  if let Err(error) = &result {
+    lock_guard.publish_error(error);
+  }
+  result
+}
+
+async fn run_locked(
+  runner: &RunnerSpec,
+  log_level: Option<&str>,
+  lock_guard: &lockfile::LockFileGuard,
+) -> anyhow::Result<()> {
+  let working_dir = runner.root.clone();
+  let mut config = Config::load_dir(&working_dir)?;
+  config.runner = Some(runner.clone());
   let keymap = config.keymap.build();
   let config = Arc::new(config);
 
@@ -53,12 +65,10 @@ pub async fn run_server(
     default_dir: Some(&working_dir),
   })?;
 
-  if let Some(err) = load_err {
-    log::warn!("Failed to load dekit config: {}", err);
-  }
+  // Visible when running in the foreground; detached runners surface
+  // these through the published record instead.
+  crate::dekit::main::print_warnings(&config.warnings);
 
-  // Create lock file and acquire exclusive flock.
-  let lock_guard = lockfile::create_lock_file(&working_dir)?;
   log::info!("Lock file created for directory: {}", working_dir.display());
 
   #[cfg(unix)]
@@ -100,6 +110,7 @@ pub async fn run_server(
       execute(&pc, &config, command).await?;
     }
     let socket = bind_server_socket(&socket_path).await?;
+    lock_guard.publish(runner, &config.warnings)?;
     log::info!("Server is listening.");
     anyhow::Ok(socket)
   }
@@ -135,9 +146,6 @@ pub async fn run_server(
   });
 
   kernel_handle.await?;
-
-  // lock_guard is dropped here, removing lock + socket files.
-  drop(lock_guard);
 
   #[cfg(unix)]
   crate::process::unix_processes_waiter::UnixProcessesWaiter::uninit()?;
@@ -175,7 +183,12 @@ pub async fn dispatch_connection(
           }
         };
         match RpcRequest::from_wire(&request.method, request.params) {
-          Ok(RpcRequest::Attach { target, width, height }) => {
+          Ok(RpcRequest::Attach {
+            target,
+            width,
+            height,
+            until_exit,
+          }) => {
             // Earlier requests are answered before the screen stream starts.
             if flush(&mut replies, &mut sender).await.is_err() {
               return;
@@ -185,6 +198,7 @@ pub async fn dispatch_connection(
               request.id,
               target,
               Size { width, height },
+              until_exit,
               sender,
               receiver,
             )
@@ -229,7 +243,7 @@ async fn flush(
   Ok(())
 }
 
-fn task_state(state: TaskState) -> RpcState {
+pub(crate) fn task_state(state: TaskState) -> RpcState {
   let (token, info) = match state {
     TaskState::Idle => ("idle", None),
     TaskState::Starting => ("starting", None),

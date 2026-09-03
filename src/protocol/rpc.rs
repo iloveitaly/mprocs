@@ -30,6 +30,10 @@ pub enum RpcRequest {
     target: Target,
     width: u16,
     height: u16,
+    /// End the session (`task_exited` bye) when the task's execution
+    /// finishes; the foreground `run` verb sets this.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    until_exit: bool,
   },
 }
 
@@ -101,7 +105,7 @@ pub struct ScreenResult {
 /// A task's lifecycle state on the wire: a stable token, plus the exit
 /// detail for `done`/`exited`. `state` is one of `idle`, `starting`,
 /// `running`, `ready`, `stopping`, `backoff`, `done`, `exited`.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RpcState {
   pub state: String,
   #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -183,6 +187,13 @@ mod tests {
         target: "@dekit/console".parse().unwrap(),
         width: 80,
         height: 24,
+        until_exit: false,
+      },
+      RpcRequest::Attach {
+        target: Target::glob("web/dev"),
+        width: 80,
+        height: 24,
+        until_exit: true,
       },
     ]
   }
@@ -204,6 +215,10 @@ mod tests {
       (
         "attach",
         r#"{"height":24,"target":"@dekit/console","width":80}"#,
+      ),
+      (
+        "attach",
+        r#"{"height":24,"target":"web/dev","until_exit":true,"width":80}"#,
       ),
     ];
     let samples = samples();

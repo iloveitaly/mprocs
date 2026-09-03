@@ -1,4 +1,4 @@
 mod attach;
 pub mod main;
-mod rpc_client;
+pub(crate) mod rpc_client;
 pub mod server;

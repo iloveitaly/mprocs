@@ -14,6 +14,7 @@ impl From<crate::mprocs::config::Config> for Config {
       ..TaskConfig::default()
     };
     Config {
+      runner: None,
       log: LogConfig::default(),
       tasks: legacy.procs.into_iter().map(TaskConfig::from).collect(),
       defaults,
@@ -30,6 +31,7 @@ impl From<crate::mprocs::config::Config> for Config {
       keymap: KeymapConfig::default(),
       on_init: legacy.on_init.map(Hook::LegacyAction),
       on_idle: legacy.on_all_finished.map(Hook::LegacyAction),
+      warnings: Vec::new(),
     }
   }
 }

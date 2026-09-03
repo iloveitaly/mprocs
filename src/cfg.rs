@@ -1,7 +1,7 @@
 //! Config parsing utilities for manual YAML -> Rust config loading.
 //!
 //! Provides:
-//! - [`CfgDoc`] — YAML document with write-back support and `$js`/`$select` pre-resolution
+//! - [`CfgDoc`] — YAML document with write-back support and `$js` pre-resolution
 //! - [`CfgNode`] / [`CfgObj`] / [`CfgArr`] — typed accessors with path tracking for errors
 //! - [`FromCfg`] / [`IntoCfg`] — conversion traits between Rust types and YAML values
 //! - [`CfgCx`] — parsing context (config dir, optional JS evaluator)
@@ -79,15 +79,19 @@ impl CfgCx {
       buf.push(rest.trim_start_matches(['/', '\\']));
       buf
     } else {
-      PathBuf::from(path)
+      let path = PathBuf::from(path);
+      if path.is_relative() {
+        self.config_dir.join(path)
+      } else {
+        path
+      }
     }
   }
 }
 
-/// Pre-process a YAML value tree, evaluating `$js` and `$select` directives.
+/// Pre-process a YAML value tree, evaluating `$js` directives.
 ///
 /// - `{"$js": "cx => expr"}` — calls `cx.js_eval` and substitutes the result.
-/// - `{"$select": "os", "linux": ..., "$else": ...}` — picks a branch by OS.
 pub fn resolve_directives(value: &Value, cx: &CfgCx) -> Result<Value> {
   match value {
     Value::Mapping(map) => {
@@ -101,16 +105,6 @@ pub fn resolve_directives(value: &Value, cx: &CfgCx) -> Result<Value> {
         } else {
           bail!("$js directive found but no JS evaluator is configured");
         }
-      }
-
-      // $select directive (first key must be "$select")
-      if map
-        .iter()
-        .next()
-        .is_some_and(|(k, _)| k.as_str() == Some("$select"))
-      {
-        let selected = resolve_select(map)?;
-        return resolve_directives(selected, cx);
       }
 
       // Recurse into mapping values
@@ -131,31 +125,7 @@ pub fn resolve_directives(value: &Value, cx: &CfgCx) -> Result<Value> {
   }
 }
 
-fn resolve_select<'a>(map: &'a serde_yaml::Mapping) -> Result<&'a Value> {
-  let selector = map
-    .get(&Value::from("$select"))
-    .and_then(|v| v.as_str())
-    .ok_or_else(|| anyhow::anyhow!("$select value must be a string"))?;
-
-  match selector {
-    "os" => {
-      let os = std::env::consts::OS;
-      if let Some(v) = map.get(&Value::from(os)) {
-        return Ok(v);
-      }
-      if let Some(v) = map.get(&Value::from("$else")) {
-        return Ok(v);
-      }
-      bail!(
-        "No match for OS '{}' in $select. Use \"$else\" for a default.",
-        os
-      )
-    }
-    other => bail!("Unknown $select kind: '{}'", other),
-  }
-}
-
-/// A config document with its `$js`/`$select` directives evaluated.
+/// A config document with its `$js` directives evaluated.
 pub struct CfgDoc {
   resolved: Value,
 }
@@ -533,8 +503,8 @@ impl FromCfg for f64 {
 }
 
 impl FromCfg for PathBuf {
-  fn from_cfg(node: &CfgNode<'_>, _cx: &CfgCx) -> Result<Self> {
-    Ok(PathBuf::from(node.as_str()?))
+  fn from_cfg(node: &CfgNode<'_>, cx: &CfgCx) -> Result<Self> {
+    Ok(cx.resolve_path(node.as_str()?))
   }
 }
 

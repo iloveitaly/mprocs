@@ -291,6 +291,7 @@ pub async fn run_app(args: Vec<String>) -> anyhow::Result<()> {
 
       let ret = client_main(
         "@dekit/console".parse::<Target>().expect("valid target"),
+        false,
         clt_to_srv_sender,
         srv_to_clt_receiver,
       )
@@ -300,7 +301,7 @@ pub async fn run_app(args: Vec<String>) -> anyhow::Result<()> {
       pc.send(crate::kernel::kernel_message::KernelCommand::Quit);
       let _ = kernel_handle.await;
       drop(logger);
-      ret
+      ret.map(|_| ())
     }
   }
 }

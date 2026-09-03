@@ -1,4 +1,7 @@
-use std::{ffi::OsString, path::PathBuf};
+use std::{
+  ffi::OsString,
+  path::{Path, PathBuf},
+};
 
 use anyhow::{Result, bail};
 use indexmap::IndexMap;
@@ -32,6 +35,7 @@ const TASK_KEYS: &[&str] = &[
   "label",
   "cmd",
   "shell",
+  "script",
   "deps",
   "tags",
   "cwd",
@@ -48,8 +52,15 @@ const TASK_KEYS: &[&str] = &[
 
 /// Tag for tasks started on `dekit up` / at launch.
 pub const AUTOSTART_TAG: &str = "autostart";
+
+pub fn is_script(path: &Path) -> bool {
+  match path.extension().and_then(|ext| ext.to_str()) {
+    Some("js" | "mjs") => true,
+    _ => false,
+  }
+}
 /// Tag for tasks added at runtime rather than from config.
-pub const USER_TAG: &str = "user";
+pub const DYNAMIC_TAG: &str = "dynamic";
 
 #[derive(Clone, Default)]
 pub struct TaskConfig {
@@ -172,19 +183,19 @@ pub(crate) fn task_from_cfg(
   }
   p.path = path;
   p.label = obj.optional("label", cx)?;
-  p.cmd = Some(cmd_from_cfg(node)?);
+  p.cmd = Some(cmd_from_cfg(node, cx)?);
   p.deps = obj.default("deps", Vec::new(), cx)?;
   p.tags = obj.default("tags", Vec::new(), cx)?;
   Ok(p)
 }
 
-fn cmd_from_cfg(node: &CfgNode<'_>) -> Result<CmdConfig> {
+fn cmd_from_cfg(node: &CfgNode<'_>, cx: &CfgCx) -> Result<CmdConfig> {
   let obj = node.as_obj()?;
-  match (obj.get("shell"), obj.get("cmd")) {
-    (Some(shell), None) => Ok(CmdConfig::Shell {
+  match (obj.get("shell"), obj.get("cmd"), obj.get("script")) {
+    (Some(shell), None, None) => Ok(CmdConfig::Shell {
       shell: shell.as_str()?.to_owned(),
     }),
-    (None, Some(cmd)) => {
+    (None, Some(cmd), None) => {
       let argv = if cmd.is_string() {
         split_argv(cmd.as_str()?).map_err(|err| cmd.error(err))?
       } else {
@@ -196,9 +207,25 @@ fn cmd_from_cfg(node: &CfgNode<'_>) -> Result<CmdConfig> {
       };
       Ok(CmdConfig::Cmd { cmd: argv })
     }
-    (None, None) => bail!(obj.error("task must define 'cmd' or 'shell'")),
-    (Some(_), Some(_)) => {
-      bail!(obj.error("task must define only one of 'cmd' or 'shell'"))
+    (None, None, Some(script)) => {
+      let path = cx.resolve_path(script.as_str()?);
+      if !is_script(&path) {
+        bail!(script.error("script must be a .js or .mjs file"));
+      }
+      if !path.is_file() {
+        bail!(
+          script.error(format!("script does not exist: {}", path.display()))
+        );
+      }
+      Ok(CmdConfig::Script { script: path })
+    }
+    (None, None, None) => {
+      bail!(obj.error("task must define 'cmd', 'shell', or 'script'"))
+    }
+    _ => {
+      bail!(
+        obj.error("task must define only one of 'cmd', 'shell', or 'script'")
+      )
     }
   }
 }
@@ -208,51 +235,74 @@ fn cmd_from_cfg(node: &CfgNode<'_>) -> Result<CmdConfig> {
 pub enum CmdConfig {
   Cmd { cmd: Vec<String> },
   Shell { shell: String },
+  Script { script: PathBuf },
 }
 
-impl From<&TaskConfig> for ProcessSpec {
-  fn from(cfg: &TaskConfig) -> Self {
-    let mut cmd = match &cfg.cmd {
-      Some(CmdConfig::Cmd { cmd }) => ProcessSpec::from_argv(cmd.clone()),
-      Some(CmdConfig::Shell { shell }) => cmd_from_shell(shell),
-      None => ProcessSpec::from_argv(Vec::new()),
-    };
+/// The spec a task runs as. `runner` is the identity script tasks
+/// inherit; registration paths validate it exists before a script task
+/// can reach here.
+pub fn process_spec(
+  cfg: &TaskConfig,
+  runner: Option<&crate::runner::RunnerSpec>,
+) -> ProcessSpec {
+  let mut cmd = match &cfg.cmd {
+    Some(CmdConfig::Cmd { cmd }) => ProcessSpec::from_argv(cmd.clone()),
+    Some(CmdConfig::Shell { shell }) => cmd_from_shell(shell),
+    Some(CmdConfig::Script { script }) => {
+      let runner = runner.expect("script tasks require a runner identity");
+      // Runner identity travels in env, not argv, so the script sees
+      // the same `[exe, script]` argv as `dekit script.js` on the CLI.
+      let mut spec = ProcessSpec::from_argv(vec![
+        std::env::current_exe()
+          .expect("current executable is available")
+          .to_string_lossy()
+          .into_owned(),
+        script.to_string_lossy().into_owned(),
+      ]);
+      spec.env(
+        crate::runner::ENV_RUNNER_ROOT,
+        runner.root.to_str().expect("validated runner root"),
+      );
+      spec.env(crate::runner::ENV_RUNNER_KIND, runner.kind.as_str());
+      spec
+    }
+    None => ProcessSpec::from_argv(Vec::new()),
+  };
 
-    if let Some(env) = &cfg.env {
-      for (k, v) in env {
-        if let Some(v) = v {
-          cmd.env(k, v);
-        } else {
-          cmd.env_remove(k);
-        }
+  if let Some(env) = &cfg.env {
+    for (k, v) in env {
+      if let Some(v) = v {
+        cmd.env(k, v);
+      } else {
+        cmd.env_remove(k);
       }
     }
-
-    if let Some(add_path) = cfg.add_path.as_ref().filter(|p| !p.is_empty()) {
-      // Base PATH is the task's own `env` override if it sets one, otherwise
-      // the ambient PATH resolved at spawn time.
-      let base = cfg
-        .env
-        .as_ref()
-        .and_then(|env| env.get("PATH").cloned().flatten())
-        .or_else(|| std::env::var("PATH").ok());
-      let mut paths: Vec<PathBuf> = add_path.clone();
-      if let Some(base) = base {
-        paths.extend(std::env::split_paths(&base));
-      }
-      if let Ok(joined) = std::env::join_paths(&paths) {
-        cmd.env("PATH", joined.to_string_lossy().into_owned());
-      }
-    }
-
-    if let Some(cwd) = &cfg.cwd {
-      cmd.cwd(cwd.to_string_lossy());
-    } else if let Ok(cwd) = std::env::current_dir() {
-      cmd.cwd(cwd.to_string_lossy());
-    }
-
-    cmd
   }
+
+  if let Some(add_path) = cfg.add_path.as_ref().filter(|p| !p.is_empty()) {
+    // Base PATH is the task's own `env` override if it sets one, otherwise
+    // the ambient PATH resolved at spawn time.
+    let base = cfg
+      .env
+      .as_ref()
+      .and_then(|env| env.get("PATH").cloned().flatten())
+      .or_else(|| std::env::var("PATH").ok());
+    let mut paths: Vec<PathBuf> = add_path.clone();
+    if let Some(base) = base {
+      paths.extend(std::env::split_paths(&base));
+    }
+    if let Ok(joined) = std::env::join_paths(&paths) {
+      cmd.env("PATH", joined.to_string_lossy().into_owned());
+    }
+  }
+
+  if let Some(cwd) = &cfg.cwd {
+    cmd.cwd(cwd.to_string_lossy());
+  } else if let Ok(cwd) = std::env::current_dir() {
+    cmd.cwd(cwd.to_string_lossy());
+  }
+
+  cmd
 }
 
 #[cfg(windows)]
@@ -322,7 +372,7 @@ cwd: /tmp
       ..Default::default()
     };
 
-    let spec = ProcessSpec::from(&cfg);
+    let spec = process_spec(&cfg, None);
     let path = spec.env.get("PATH").cloned().flatten().unwrap();
 
     let expected = std::env::join_paths([

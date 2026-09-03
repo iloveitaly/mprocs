@@ -1,59 +1,72 @@
-use std::{path::Path, time::Duration};
+use std::time::Duration;
 
-use crate::daemon::{
-  lockfile::{self, cleanup_stale, daemon_paths, read_lock_file},
-  spawn::spawn_server_daemon,
-};
+use anyhow::Context;
+
 use crate::protocol::{ConnReceiver, ConnSender};
+use crate::runner::{RunnerSpec, resolve_kernel_binary};
+use crate::runner::{
+  lockfile::{self, RunnerState, cleanup_paths, runner_paths},
+  spawn::spawn_runner,
+};
 
 pub async fn connect_client_socket(
-  working_dir: &Path,
-  spawn_server: bool,
+  runner: &RunnerSpec,
+  start_runner: bool,
 ) -> anyhow::Result<(ConnSender, ConnReceiver)> {
-  let (lock_path, _socket_path) = daemon_paths(working_dir)?;
-
-  let daemon_running = match read_lock_file(&lock_path) {
-    Some(_) if lockfile::is_daemon_alive(&lock_path) => true,
-    Some(_) => {
-      let _ = cleanup_stale(working_dir);
-      false
-    }
-    None => false,
-  };
-
-  if !daemon_running {
-    if spawn_server {
-      spawn_server_daemon(working_dir)?;
-    } else {
-      anyhow::bail!("Daemon is not running. Start it with `dekit up`.");
-    }
-  }
-
-  if daemon_running {
-    return connect_to_daemon(&lock_path).await;
-  }
-
-  let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+  let paths = runner_paths(runner)?;
+  let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+  let mut spawn_attempted = false;
+  let mut connect_error = None;
   loop {
-    if read_lock_file(&lock_path).is_some()
-      && lockfile::is_daemon_alive(&lock_path)
-      && let Ok(conn) = connect_to_daemon(&lock_path).await
-    {
-      return Ok(conn);
+    match lockfile::runner_state(runner, &paths)? {
+      RunnerState::Ready(record) => {
+        match connect_socket(&record.socket).await {
+          Ok(conn) => return Ok(conn),
+          Err(error) => connect_error = Some(error),
+        }
+      }
+      RunnerState::Starting => {}
+      RunnerState::Absent | RunnerState::Stale(_) | RunnerState::Failed(_)
+        if start_runner && !spawn_attempted =>
+      {
+        cleanup_paths(&paths)?;
+        match lockfile::runner_state(runner, &paths)? {
+          RunnerState::Ready(_) | RunnerState::Starting => continue,
+          RunnerState::Absent
+          | RunnerState::Stale(_)
+          | RunnerState::Failed(_) => {}
+        }
+        let executable = resolve_kernel_binary(runner)?;
+        spawn_runner(runner, &executable)?;
+        spawn_attempted = true;
+      }
+      RunnerState::Failed(error) => {
+        anyhow::bail!("runner failed to start: {error}");
+      }
+      RunnerState::Absent | RunnerState::Stale(_) if !start_runner => {
+        anyhow::bail!("Runner is not running. Start it with `dekit up`.");
+      }
+      // A record without a live lock after our spawn: the runner came up
+      // and then died without reporting an error.
+      RunnerState::Stale(_) => {
+        cleanup_paths(&paths)?;
+        anyhow::bail!("runner exited unexpectedly after starting");
+      }
+      // The spawned runner has not created its lock yet.
+      RunnerState::Absent => {}
     }
     if tokio::time::Instant::now() >= deadline {
-      anyhow::bail!("Timed out waiting for daemon to start.");
+      if let Some(error) = connect_error {
+        return Err(error)
+          .context("runner stayed registered but could not be reached");
+      }
+      if spawn_attempted {
+        anyhow::bail!("spawned runner did not become ready within 15s");
+      }
+      anyhow::bail!("Timed out waiting for runner to become ready.");
     }
     tokio::time::sleep(Duration::from_millis(20)).await;
   }
-}
-
-async fn connect_to_daemon(
-  lock_path: &Path,
-) -> anyhow::Result<(ConnSender, ConnReceiver)> {
-  let contents = read_lock_file(lock_path)
-    .ok_or_else(|| anyhow::anyhow!("Failed to read daemon lock file."))?;
-  connect_socket(&contents.socket).await
 }
 
 #[cfg(unix)]
@@ -84,7 +97,7 @@ mod unix {
       },
     };
 
-    // Only the owner may talk to the daemon.
+    // Only the owner may talk to the runner.
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(
       socket_path,
@@ -113,7 +126,7 @@ mod unix {
   ) -> anyhow::Result<(ConnSender, ConnReceiver)> {
     let stream = UnixStream::connect(socket)
       .await
-      .map_err(|e| anyhow::anyhow!("Failed to connect to daemon: {}", e))?;
+      .map_err(|e| anyhow::anyhow!("Failed to connect to runner: {}", e))?;
     let (read, write) = stream.into_split();
     Ok((ConnSender::new(write), ConnReceiver::new(read)))
   }
@@ -170,12 +183,12 @@ mod windows {
         Ok(pipe) => break pipe,
         Err(err) if err.raw_os_error() == Some(PIPE_BUSY) => {
           if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("Failed to connect to daemon: pipe is busy");
+            anyhow::bail!("Failed to connect to runner: pipe is busy");
           }
           tokio::time::sleep(Duration::from_millis(20)).await;
         }
         Err(err) => {
-          anyhow::bail!("Failed to connect to daemon: {}", err);
+          anyhow::bail!("Failed to connect to runner: {}", err);
         }
       }
     };
